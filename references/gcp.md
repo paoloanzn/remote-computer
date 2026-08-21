@@ -4,7 +4,7 @@ Use this reference only after the user selects Google Cloud. Commands are templa
 
 ## Official sources
 
-Fetched from official Google Cloud documentation on 2026-08-15:
+Fetched from official Google Cloud documentation on 2026-08-21:
 
 - [Initialize the gcloud CLI](https://cloud.google.com/sdk/docs/initializing)
 - [`gcloud auth list`](https://cloud.google.com/sdk/gcloud/reference/auth/list)
@@ -12,8 +12,20 @@ Fetched from official Google Cloud documentation on 2026-08-15:
 - [Add SSH keys to VMs](https://cloud.google.com/compute/docs/connect/add-ssh-keys)
 - [`gcloud compute instances describe`](https://cloud.google.com/sdk/gcloud/reference/compute/instances/describe)
 - [Google Cloud Free Tier limits](https://cloud.google.com/free/docs/free-cloud-features#compute)
+- [Linux VM startup scripts](https://cloud.google.com/compute/docs/instances/startup-scripts/linux)
+- [Stop a Compute Engine instance from the guest OS](https://cloud.google.com/compute/docs/instances/stop-start-instance#stop_an_instance_from_inside)
+- [Compute Engine VM pricing](https://cloud.google.com/compute/vm-instance-pricing)
+- [Compute Engine instance lifecycle and billable states](https://docs.cloud.google.com/compute/docs/instances/instance-lifecycle)
 
 Re-fetch the Free Tier page immediately before representing a deployment as allowance-eligible. Product docs establish limits and syntax; consult current pricing for costs outside those limits.
+
+## Resolve the compute cost control
+
+Immediately before confirmation, obtain the selected machine type's current Linux on-demand hourly compute rate for the exact region from an official Google Cloud pricing source. Do not use a rate copied from this repository or assume the Free Tier allowance remains unused. Record the source label and UTC check time, then run `vm_bookkeeper.py plan-cost` and `render-cost-guard` as required by `SKILL.md`.
+
+Compute Engine vCPU and memory usage has a 60-second minimum for each start-to-stop billing lifecycle before per-second billing. The helper models one single uninterrupted provider billing lifecycle and applies one minimum even when the requested runtime is shorter. Starting a stopped VM begins another lifecycle and another minimum, so obtain a fresh admission before every start. Repeated or out-of-band starts can exceed the recorded budget because the guest guard cannot prevent Google Cloud from charging for a start attempt. The projection covers VM compute at the supplied rate for the admitted lifecycle. It does not cap the total cloud bill. Persistent disks and provisioned performance, snapshots, network transfer, external IPv4, premium images, taxes, discounts, credits, and other services remain outside it. Stopping the VM ends VM compute charges, but retained disks and other resources can continue to incur charges.
+
+GCP continues CPU and memory charges while a VM is in `PENDING_STOP`, so `cost-status` treats that state as cost-incurring until the provider reaches `STOPPING` or `TERMINATED`. It also treats `SUSPENDING` and `SUSPENDED` conservatively because GCP continues memory charges in those states.
 
 ## Google Cloud Free Tier caveats
 
@@ -90,7 +102,7 @@ gcloud compute instances create <vm-name> \
   --boot-disk-size 30GB --boot-disk-type <pd-balanced-or-pd-standard> \
   --boot-disk-auto-delete \
   --metadata enable-oslogin=FALSE,block-project-ssh-keys=TRUE \
-  --metadata-from-file ssh-keys=<temporary-public-metadata-file> \
+  --metadata-from-file ssh-keys=<temporary-public-metadata-file>,startup-script=<cost-guard-script> \
   --format=json
 ```
 
@@ -101,5 +113,7 @@ gcloud compute instances describe <vm-name> --project <project-id> --zone <zone>
 ```
 
 Require `RUNNING` and capture `networkInterfaces[0].accessConfigs[0].natIP`. If there is no external IP, do not synthesize a direct SSH command; explain that IAP, VPN, or an explicit external access configuration is required.
+
+Official Ubuntu images include the Google guest environment, which runs the attached startup script as root. A guest `shutdown -h now` stops the VM rather than deleting it. After SSH is available, verify the timer, boot-time check, and deadline with the commands in `SKILL.md`. If startup-script execution is incomplete, inspect `sudo journalctl -u google-startup-scripts.service --no-pager` without exposing unrelated credential output. Do not claim cost-control success until the timer is enabled and active, the boot service is enabled, and the planned UTC deadline is scheduled.
 
 For direct OpenSSH, use the dedicated private key and user `ubuntu`. `gcloud compute ssh` is an alternative, but it may manage keys itself and is not the direct command required by this workflow.

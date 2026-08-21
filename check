@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+PYTHON_BIN="${REMOTE_COMPUTER_PYTHON:-python3}"
+NPX_BIN="${REMOTE_COMPUTER_NPX:-npx}"
+
+"$PYTHON_BIN" -B -m unittest discover -s tests -v
+"$PYTHON_BIN" -B scripts/quick_validate.py .
+sh -n install-skill.sh
+"$NPX_BIN" --yes pyright@1.1.413 --level error
+
+skills_dir="$(mktemp -d)"
+trap 'rm -rf "$skills_dir"' EXIT INT TERM
+SOURCE_DIR="$PWD" SKILLS_DIR="$skills_dir" AGENT=codex sh install-skill.sh
+installed="$skills_dir/remote-computer"
+"$PYTHON_BIN" -B scripts/quick_validate.py "$installed"
+diff -ru SKILL.md "$installed/SKILL.md"
+diff -ru agents "$installed/agents"
+diff -u scripts/vm_bookkeeper.py "$installed/scripts/vm_bookkeeper.py"
+diff -u scripts/remote_github_setup.py "$installed/scripts/remote_github_setup.py"
+diff -ru references "$installed/references"
+test ! -e "$installed/tests"
+test ! -e "$installed/.git"
+test ! -e "$installed/scripts/quick_validate.py"

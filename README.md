@@ -1,11 +1,11 @@
 # remote-computer
 
-A Codex/Claude agent skill for provisioning auditable remote development VMs on AWS EC2 or Google Cloud Compute Engine. It discovers installed cloud CLIs, verifies account/project context, offers practical machine presets, creates dedicated SSH access, optionally ports Git identity, GitHub authentication, and commit signing, tracks live instances in `~/.vms.json`, reconciles provider status, and places a direct SSH command on the clipboard.
+A Codex/Claude agent skill for provisioning auditable remote development VMs on AWS EC2 or Google Cloud Compute Engine. It discovers installed cloud CLIs, verifies account/project context, offers practical machine presets, creates dedicated SSH access, plans one uninterrupted compute run against an explicit budget, enforces an auto-stop deadline, optionally ports Git identity, GitHub authentication, and commit signing, tracks live instances in `~/.vms.json`, reconciles provider status, and places a direct SSH command on the clipboard.
 
 ## Install or update
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/paoloanzn/remote-computer/main/install-skill.sh | sh
+curl -fsSL https://raw.githubusercontent.com/aidvgg/remote-computer/main/install-skill.sh | sh
 ```
 
 The installer auto-detects Codex or Claude. Override with `AGENT=codex`, `AGENT=claude`, or `SKILLS_DIR=/custom/path`.
@@ -20,9 +20,27 @@ Ask the agent to use `$remote-computer`, for example: “Use `$remote-computer` 
 | Standard | `t3.large` · 2 vCPU · 8 GiB | `e2-standard-2` · 2 vCPU · 8 GiB |
 | Performance | `t3.xlarge` · 4 vCPU · 16 GiB | `e2-standard-4` · 4 vCPU · 16 GiB |
 | Heavy | `t3.2xlarge` · 8 vCPU · 32 GiB | `e2-standard-8` · 8 vCPU · 32 GiB |
-| Free Tier allowance | — | eligible `e2-micro` usage in selected US regions; limits apply |
+| Free Tier allowance | none | eligible `e2-micro` usage in selected US regions; limits apply |
 
 Requirements: Python 3.10+, `ssh-keygen`, `ssh`, `scp`, and at least one configured provider CLI (`aws` or `gcloud`). GitHub configuration discovery uses local Git/GPG/SSH metadata and optionally `gh`; it never reads token values or private-key contents. Clipboard handoff uses `pbcopy` on macOS or `wl-copy`, `xclip`, or `xsel` on Linux, with a printed-command fallback.
+
+## Cost controls
+
+Every deployment can bind a current provider compute rate to a maximum runtime and USD compute budget for one single uninterrupted provider billing lifecycle before cloud creation:
+
+```sh
+python3 scripts/vm_bookkeeper.py plan-cost \
+  --hourly-rate-usd 0.0832 --max-runtime-hours 8 --max-compute-usd 1.00
+python3 scripts/vm_bookkeeper.py render-cost-guard \
+  --stop-at <stop-at-from-plan> --output /tmp/remote-computer-cost-guard.sh
+python3 scripts/vm_bookkeeper.py cost-status
+```
+
+Use `--max-runtime-seconds` instead of `--max-runtime-hours` for an exact whole-second deadline such as 60 seconds or five minutes. Hour values must convert exactly to whole seconds. `plan-cost` returns canonical `max_runtime_seconds` for registry upsert.
+
+`plan-cost` exits nonzero when the projected compute amount exceeds the budget or the pricing check is more than 24 hours old. Its single-lifecycle projection applies one AWS or GCP 60-second minimum before per-second pricing. A repeating decimal charge is rounded upward to 28 decimal places, never downward into an approval. Admission inputs support at most 128 significant digits and exponent magnitude 128; generated projections reserve additional precision so accepted plans round-trip through the registry. `render-cost-guard` creates startup data that installs an absolute UTC systemd timer and a boot-time expiry check inside the VM. The guest shuts itself down at the deadline even when the local computer is offline, and a later manual restart after expiry stops again. The registry records the rate, source, check time, budget, runtime, projection, deadline, and guard type.
+
+The budget comparison models one uninterrupted provider billing lifecycle only. Every provider stop/start begins another billing lifecycle and another minimum charge, so re-plan before starting a stopped VM. Repeated or out-of-band starts can exceed the recorded budget because a guest-side guard cannot prevent the provider from charging for the attempt. The projection also does not cap the total cloud bill. Boot disks, snapshots, network transfer, public IPs, premium images, taxes, discounts, credits, and other services remain outside it. Stopping a VM does not delete its disks or other resources.
 
 ## Safety and state
 
@@ -41,10 +59,7 @@ python3 scripts/vm_bookkeeper.py sync
 
 ```sh
 python3 -m pip install PyYAML
-npx --yes pyright@1.1.413 --level error
-python3 -m unittest discover -s tests -v
-python3 scripts/quick_validate.py .
-sh -n install-skill.sh
+./check
 ```
 
 CI runs strict Pyright, unit/integration tests, skill validation, and shell syntax checks on pushes and pull requests.

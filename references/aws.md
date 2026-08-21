@@ -4,15 +4,25 @@ Use this reference only after the user selects AWS. Commands are templates: reso
 
 ## Official sources
 
-Fetched from official AWS documentation on 2026-08-15:
+Fetched from official AWS documentation on 2026-08-21:
 
 - [AWS CLI configuration and credential files](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html)
 - [`sts get-caller-identity`](https://docs.aws.amazon.com/cli/latest/reference/sts/get-caller-identity.html)
 - [`ec2 import-key-pair`](https://docs.aws.amazon.com/cli/latest/reference/ec2/import-key-pair.html)
 - [`ec2 run-instances`](https://docs.aws.amazon.com/cli/latest/reference/ec2/run-instances.html)
 - [`ec2 describe-instance-status`](https://docs.aws.amazon.com/cli/latest/reference/ec2/describe-instance-status.html)
+- [Run commands with EC2 user data](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html)
+- [EC2 instance state changes and shutdown behavior](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-lifecycle.html)
+- [EC2 On-Demand pricing](https://aws.amazon.com/ec2/pricing/on-demand/)
+- [EC2 On-Demand instance billing model](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-on-demand-instances.html)
 
 Re-fetch these pages if current syntax, regional availability, pricing, or quotas matter. CLI references establish command behavior, not price.
+
+## Resolve the compute cost control
+
+Immediately before confirmation, obtain the selected instance type's current Linux on-demand hourly compute rate for the exact region from an official AWS pricing source. Do not use a rate copied from this repository, another region, a Spot quote, or a Free Tier assumption. Record the source label and UTC check time, then run `vm_bookkeeper.py plan-cost` and `render-cost-guard` as required by `SKILL.md`.
+
+Linux On-Demand usage is billed per second with a 60-second minimum for each billing lifecycle. The helper models one single uninterrupted provider billing lifecycle and applies one minimum even when the requested runtime is shorter. Starting a stopped instance begins another lifecycle and another minimum, so obtain a fresh admission before every start. Repeated or out-of-band starts can exceed the recorded budget because the guest guard cannot prevent AWS from charging for a start attempt. The projection covers EC2 instance compute at the supplied rate for the admitted lifecycle. It does not cap the total cloud bill. EBS volumes and provisioned performance, snapshots, data transfer, Elastic IP or public IPv4 charges, premium software, taxes, discounts, credits, and other services remain outside it. Stopping the instance ends instance compute charges, but retained EBS and other resources can continue to incur charges.
 
 ## Verify context
 
@@ -76,6 +86,9 @@ aws ec2 run-instances \
   --image-id <ami-id> --instance-type <machine-type> \
   --key-name <key-name> --subnet-id <subnet-id> \
   --security-group-ids <security-group-id> --associate-public-ip-address \
+  <for-t-family-only: --credit-specification CpuCredits=standard> \
+  --instance-initiated-shutdown-behavior stop \
+  --user-data file://<cost-guard-script> \
   --metadata-options HttpTokens=required,HttpEndpoint=enabled \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=30,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=<vm-name>},{Key=ManagedBy,Value=remote-computer}]' \
@@ -91,3 +104,5 @@ aws ec2 describe-instance-status --region <region> --include-all-instances --ins
 ```
 
 Wait for a public IP and running state. System/instance status checks may remain initializing briefly; report that honestly. The direct login for the Ubuntu image is usually `ubuntu`.
+
+For the `t3` presets, use `--credit-specification CpuCredits=standard` so surplus CPU credits cannot create compute charges above the supplied instance rate. Omit that argument for machine families that do not support CPU credit specification. The explicit `--instance-initiated-shutdown-behavior stop` is required so the guard's guest-OS shutdown stops the EBS-backed instance rather than terminating it. After SSH is available, verify the timer, boot-time check, and deadline with the commands in `SKILL.md`. If the user-data run is incomplete, inspect `sudo journalctl -u cloud-final.service --no-pager` without exposing unrelated credential output. Do not claim cost-control success until the timer is enabled and active, the boot service is enabled, and the planned UTC deadline is scheduled.

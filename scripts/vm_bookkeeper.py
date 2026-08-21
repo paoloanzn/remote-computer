@@ -12,7 +12,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, localcontext
+from fractions import Fraction
 from pathlib import Path
 from typing import TypedDict, cast
 
@@ -23,7 +25,18 @@ class KeyPair(TypedDict):
     cloud_name: str
 
 
-class VMRecord(TypedDict):
+class CostControl(TypedDict):
+    hourly_rate_usd: str
+    max_runtime_seconds: str
+    max_compute_usd: str
+    projected_compute_usd: str
+    stop_at: str
+    pricing_source: str
+    pricing_checked_at: str
+    guard: str
+
+
+class VMRecordRequired(TypedDict):
     provider: str
     id: str
     name: str
@@ -35,6 +48,10 @@ class VMRecord(TypedDict):
     status: str
     created_at: str
     checked_at: str
+
+
+class VMRecord(VMRecordRequired, total=False):
+    cost_control: CostControl
 
 
 class GithubKeyPair(TypedDict):
@@ -78,10 +95,262 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 GITHUB_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 GITHUB_SOURCE_VALUES = {"discovered", "generated"}
 GITHUB_SSH_GREETING_RE = re.compile(r"Hi ([A-Za-z0-9][A-Za-z0-9._-]{0,62})! You've successfully authenticated")
+DECIMAL_INPUT_RE = re.compile(r"^(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+COST_CONTROL_FIELDS = (
+    "hourly_rate_usd",
+    "max_runtime_seconds",
+    "max_compute_usd",
+    "stop_at",
+    "pricing_source",
+    "pricing_checked_at",
+)
+COST_GUARD = "instance-systemd-stop"
+COST_INCURRING_STATES = {
+    "pending",
+    "pending_stop",
+    "provisioning",
+    "running",
+    "staging",
+    "suspended",
+    "suspending",
+}
+MINIMUM_BILLABLE_SECONDS = 60
+REPEATING_PROJECTION_PLACES = 28
+MAX_DECIMAL_INPUT_CHARACTERS = 512
+MAX_DECIMAL_DIGITS = 128
+MAX_DECIMAL_EXPONENT = 128
+MAX_PROJECTED_DECIMAL_DIGITS = (
+    MAX_DECIMAL_DIGITS + MAX_DECIMAL_EXPONENT + REPEATING_PROJECTION_PLACES
+)
+MAX_PROJECTED_DECIMAL_EXPONENT = MAX_DECIMAL_EXPONENT + REPEATING_PROJECTION_PLACES
+MAX_RUNTIME_SECONDS_DIGITS = 20
+MAX_PRICING_AGE = timedelta(hours=24)
+MAX_CLOCK_SKEW = timedelta(minutes=5)
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return format_utc(utc_now())
+
+
+def format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def parse_utc(value: str, field: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field} must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError(f"{field} must include a UTC offset")
+    return parsed.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def positive_decimal(
+    value: object,
+    field: str,
+    max_digits: int = MAX_DECIMAL_DIGITS,
+    max_exponent: int = MAX_DECIMAL_EXPONENT,
+) -> Decimal:
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError(f"{field} must be a positive decimal string")
+    text = value
+    if len(text) > MAX_DECIMAL_INPUT_CHARACTERS:
+        raise ValueError(
+            f"{field} exceeds supported precision of {max_digits} digits"
+        )
+    if not DECIMAL_INPUT_RE.fullmatch(text):
+        raise ValueError(f"{field} must be a positive decimal string")
+    try:
+        parsed = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"{field} must be a positive decimal string") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise ValueError(f"{field} must be a positive decimal string")
+    decimal_tuple = parsed.as_tuple()
+    significant_digits = list(decimal_tuple.digits)
+    exponent = int(decimal_tuple.exponent)
+    while len(significant_digits) > 1 and significant_digits[-1] == 0:
+        significant_digits.pop()
+        exponent += 1
+    if len(significant_digits) > max_digits or abs(exponent) > max_exponent:
+        raise ValueError(
+            f"{field} exceeds supported precision of {max_digits} digits "
+            f"and exponent magnitude {max_exponent}"
+        )
+    return parsed
+
+
+def positive_integer(value: object, field: str) -> int:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or not re.fullmatch(r"[0-9]+", value)
+    ):
+        raise ValueError(f"{field} must be a positive whole-second string")
+    text = value
+    if len(text) > MAX_RUNTIME_SECONDS_DIGITS:
+        raise ValueError(f"{field} is outside the supported runtime range")
+    parsed = int(text)
+    if parsed <= 0:
+        raise ValueError(f"{field} must be a positive whole-second string")
+    return parsed
+
+
+def decimal_text(value: Decimal) -> str:
+    return format(value, "f")
+
+
+def exact_decimal_product(left: Decimal, right: Decimal) -> Decimal:
+    required_precision = max(1, len(left.as_tuple().digits) + len(right.as_tuple().digits))
+    with localcontext() as context:
+        context.prec = required_precision
+        return left * right
+
+
+def finite_fraction_text(value: Fraction) -> str:
+    if value < 0:
+        raise ValueError("finite decimal value must not be negative")
+    denominator = value.denominator
+    twos = 0
+    fives = 0
+    while denominator % 2 == 0:
+        denominator //= 2
+        twos += 1
+    while denominator % 5 == 0:
+        denominator //= 5
+        fives += 1
+    if denominator != 1:
+        raise ValueError("fraction does not have a finite decimal expansion")
+    places = max(twos, fives)
+    scale = 10**places
+    scaled = value.numerator * scale // value.denominator
+    if places == 0:
+        return str(scaled)
+    integer, fraction = divmod(scaled, scale)
+    fractional_text = f"{fraction:0{places}d}".rstrip("0")
+    return str(integer) if not fractional_text else f"{integer}.{fractional_text}"
+
+
+def conservative_fraction_text(value: Fraction) -> str:
+    try:
+        return finite_fraction_text(value)
+    except ValueError:
+        scale = 10**REPEATING_PROJECTION_PLACES
+        scaled, remainder = divmod(value.numerator * scale, value.denominator)
+        if remainder:
+            scaled += 1
+        integer, fraction = divmod(scaled, scale)
+        fractional_text = f"{fraction:0{REPEATING_PROJECTION_PLACES}d}".rstrip("0")
+        return str(integer) if not fractional_text else f"{integer}.{fractional_text}"
+
+
+def projected_compute(rate: Decimal, runtime_seconds: int) -> Decimal:
+    billable_seconds = max(runtime_seconds, MINIMUM_BILLABLE_SECONDS)
+    charge = Fraction(rate) * Fraction(billable_seconds, 3600)
+    return Decimal(conservative_fraction_text(charge))
+
+
+def runtime_seconds_from_hours(value: object, field: str = "max_runtime_hours") -> int:
+    runtime = positive_decimal(value, field)
+    seconds = exact_decimal_product(runtime, Decimal(3600))
+    if seconds != seconds.to_integral_value():
+        raise ValueError(
+            f"{field} must resolve exactly to whole seconds; use max_runtime_seconds otherwise"
+        )
+    return int(seconds)
+
+
+def validate_pricing_time(value: datetime, current: datetime | None = None) -> None:
+    checked_at = value.astimezone(timezone.utc)
+    reference = (current or utc_now()).astimezone(timezone.utc)
+    if checked_at > reference + MAX_CLOCK_SKEW:
+        raise ValueError("pricing check time is in the future")
+    if reference - checked_at > MAX_PRICING_AGE:
+        raise ValueError("pricing check is stale; refresh the official provider rate")
+
+
+def cost_plan(
+    hourly_rate_usd: str,
+    max_runtime_seconds: str,
+    max_compute_usd: str,
+    start_at: str,
+) -> dict[str, object]:
+    rate = positive_decimal(hourly_rate_usd, "hourly_rate_usd")
+    runtime_seconds = positive_integer(max_runtime_seconds, "max_runtime_seconds")
+    budget = positive_decimal(max_compute_usd, "max_compute_usd")
+    billable_seconds = max(runtime_seconds, MINIMUM_BILLABLE_SECONDS)
+    projected = projected_compute(rate, runtime_seconds)
+    if projected > budget:
+        raise ValueError(
+            f"projected compute cost {decimal_text(projected)} USD exceeds the compute budget "
+            f"{decimal_text(budget)} USD"
+        )
+    start = parse_utc(start_at, "start_at")
+    try:
+        stop = start + timedelta(seconds=runtime_seconds)
+    except OverflowError as exc:
+        raise ValueError("max_runtime_seconds is outside the supported timestamp range") from exc
+    return {
+        "hourly_rate_usd": decimal_text(rate),
+        "max_runtime_seconds": str(runtime_seconds),
+        "max_compute_usd": decimal_text(budget),
+        "projected_compute_usd": decimal_text(projected),
+        "remaining_compute_usd": finite_fraction_text(Fraction(budget) - Fraction(projected)),
+        "billable_compute_seconds": billable_seconds,
+        "minimum_billable_seconds": MINIMUM_BILLABLE_SECONDS,
+        "start_at": format_utc(start),
+        "stop_at": format_utc(stop),
+        "within_budget": True,
+        "scope": "compute-only",
+    }
+
+
+def validate_cost_control(value: object) -> CostControl:
+    if not isinstance(value, dict):
+        raise ValueError("cost_control must be an object")
+    policy = cast(dict[str, object], value)
+    required = (*COST_CONTROL_FIELDS, "projected_compute_usd", "guard")
+    missing = [field for field in required if field not in policy]
+    if missing:
+        raise ValueError(f"cost_control is missing required fields: {', '.join(missing)}")
+    rate = positive_decimal(policy["hourly_rate_usd"], "cost_control.hourly_rate_usd")
+    runtime_seconds = positive_integer(
+        policy["max_runtime_seconds"], "cost_control.max_runtime_seconds"
+    )
+    budget = positive_decimal(policy["max_compute_usd"], "cost_control.max_compute_usd")
+    projected = positive_decimal(
+        policy["projected_compute_usd"],
+        "cost_control.projected_compute_usd",
+        MAX_PROJECTED_DECIMAL_DIGITS,
+        MAX_PROJECTED_DECIMAL_EXPONENT,
+    )
+    expected_projection = projected_compute(rate, runtime_seconds)
+    if projected != expected_projection:
+        raise ValueError(
+            "cost_control.projected_compute_usd does not match rate times provider-billable duration"
+        )
+    if projected > budget:
+        raise ValueError("cost_control projected compute exceeds its compute budget")
+    stop_at = parse_utc(str(policy["stop_at"]), "cost_control.stop_at")
+    pricing_checked_at = parse_utc(str(policy["pricing_checked_at"]), "cost_control.pricing_checked_at")
+    try:
+        expected_stop = pricing_checked_at + timedelta(seconds=runtime_seconds)
+    except OverflowError as exc:
+        raise ValueError("cost_control.max_runtime_seconds is outside the supported timestamp range") from exc
+    if stop_at != expected_stop:
+        raise ValueError("cost_control.stop_at does not match pricing check time plus runtime")
+    source = policy["pricing_source"]
+    if not isinstance(source, str) or not source.strip() or len(source) > 1024:
+        raise ValueError("cost_control.pricing_source must be a non-empty string of at most 1024 characters")
+    if policy["guard"] != COST_GUARD:
+        raise ValueError(f"cost_control.guard must be {COST_GUARD}")
+    return cast(CostControl, policy)
 
 
 def registry_path(value: str | None) -> Path:
@@ -110,6 +379,8 @@ def validate_registry(data: object) -> Registry:
         vm_id = item.get("id")
         if provider not in VALID_PROVIDERS or not isinstance(vm_id, str) or not vm_id:
             raise ValueError("every VM needs a valid provider and non-empty id")
+        if "cost_control" in item:
+            validate_cost_control(item["cost_control"])
     raw_github = raw.get("github_auth")
     if raw_github is not None:
         if not isinstance(raw_github, list):
@@ -858,6 +1129,183 @@ def cmd_github_install_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_plan_cost(args: argparse.Namespace) -> int:
+    start_at = str(args.start_at) if args.start_at else now()
+    validate_pricing_time(parse_utc(start_at, "start_at"))
+    seconds_value = getattr(args, "max_runtime_seconds", None)
+    hours_value = getattr(args, "max_runtime_hours", None)
+    if seconds_value is not None and hours_value is not None:
+        raise ValueError("supply exactly one of max_runtime_seconds or max_runtime_hours")
+    if seconds_value is not None:
+        runtime_seconds = positive_integer(str(seconds_value), "max_runtime_seconds")
+    elif hours_value is not None:
+        runtime_seconds = runtime_seconds_from_hours(str(hours_value))
+    else:
+        raise ValueError("supply exactly one of max_runtime_seconds or max_runtime_hours")
+    plan = cost_plan(
+        str(args.hourly_rate_usd),
+        str(runtime_seconds),
+        str(args.max_compute_usd),
+        start_at,
+    )
+    print(json.dumps(plan, indent=2, sort_keys=True))
+    return 0
+
+
+def cost_control_from_args(args: argparse.Namespace) -> CostControl | None:
+    values = {field: getattr(args, field, None) for field in COST_CONTROL_FIELDS}
+    supplied = [field for field, value in values.items() if value is not None]
+    if not supplied:
+        return None
+    if len(supplied) != len(COST_CONTROL_FIELDS):
+        missing = [field for field in COST_CONTROL_FIELDS if values[field] is None]
+        raise ValueError(
+            "cost-control fields must be supplied together; missing: " + ", ".join(missing)
+        )
+    pricing_checked_at = format_utc(parse_utc(str(values["pricing_checked_at"]), "pricing_checked_at"))
+    validate_pricing_time(parse_utc(pricing_checked_at, "pricing_checked_at"))
+    plan = cost_plan(
+        str(values["hourly_rate_usd"]),
+        str(values["max_runtime_seconds"]),
+        str(values["max_compute_usd"]),
+        pricing_checked_at,
+    )
+    stop_at = format_utc(parse_utc(str(values["stop_at"]), "stop_at"))
+    if stop_at != plan["stop_at"]:
+        raise ValueError("stop_at must equal pricing_checked_at plus max_runtime_seconds")
+    source = str(values["pricing_source"]).strip()
+    policy: CostControl = {
+        "hourly_rate_usd": str(plan["hourly_rate_usd"]),
+        "max_runtime_seconds": str(plan["max_runtime_seconds"]),
+        "max_compute_usd": str(plan["max_compute_usd"]),
+        "projected_compute_usd": str(plan["projected_compute_usd"]),
+        "stop_at": stop_at,
+        "pricing_source": source,
+        "pricing_checked_at": pricing_checked_at,
+        "guard": COST_GUARD,
+    }
+    return validate_cost_control(policy)
+
+
+def cost_guard_script(stop_at: str) -> str:
+    deadline = parse_utc(stop_at, "stop_at")
+    on_calendar = deadline.strftime("%Y-%m-%d %H:%M:%S UTC")
+    deadline_epoch = int(deadline.timestamp())
+    return f"""#!/bin/sh
+set -eu
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "remote-computer cost guard must run as root" >&2
+  exit 1
+fi
+
+cat > /usr/local/sbin/remote-computer-cost-guard-check <<'REMOTE_COMPUTER_COST_CHECK'
+#!/bin/sh
+set -eu
+deadline_epoch={deadline_epoch}
+current_epoch="$(date -u +%s)"
+if [ "$current_epoch" -lt "$deadline_epoch" ]; then
+  exit 0
+fi
+exec /sbin/shutdown -h now
+REMOTE_COMPUTER_COST_CHECK
+chmod 0755 /usr/local/sbin/remote-computer-cost-guard-check
+
+cat > /etc/systemd/system/remote-computer-cost-guard.service <<'REMOTE_COMPUTER_COST_SERVICE'
+[Unit]
+Description=Stop remote-computer VM at its approved compute deadline
+After=time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/remote-computer-cost-guard-check
+
+[Install]
+WantedBy=multi-user.target
+REMOTE_COMPUTER_COST_SERVICE
+
+cat > /etc/systemd/system/remote-computer-cost-guard.timer <<'REMOTE_COMPUTER_COST_TIMER'
+[Unit]
+Description=Absolute compute deadline for remote-computer VM
+
+[Timer]
+OnCalendar={on_calendar}
+Persistent=true
+AccuracySec=1s
+Unit=remote-computer-cost-guard.service
+
+[Install]
+WantedBy=timers.target
+REMOTE_COMPUTER_COST_TIMER
+
+systemctl daemon-reload
+systemctl enable remote-computer-cost-guard.service
+systemctl enable --now remote-computer-cost-guard.timer
+systemctl start remote-computer-cost-guard.service
+"""
+
+
+def cmd_render_cost_guard(args: argparse.Namespace) -> int:
+    output = Path(str(args.output)).expanduser()
+    rendered = cost_guard_script(str(args.stop_at))
+    output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(output, flags, 0o600)
+    except FileExistsError:
+        raise FileExistsError(f"refusing to overwrite existing cost guard: {output}") from None
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(rendered)
+    print(json.dumps({"output": str(output), "stop_at": format_utc(parse_utc(str(args.stop_at), "stop_at"))}, sort_keys=True))
+    return 0
+
+
+def cost_status(record: VMRecord, checked_at: datetime) -> dict[str, object]:
+    policy = record.get("cost_control")
+    base: dict[str, object] = {
+        "provider": record["provider"],
+        "id": record["id"],
+        "name": record["name"],
+        "provider_status": record["status"],
+    }
+    if policy is None:
+        return {**base, "cost_status": "uncontrolled"}
+    deadline = parse_utc(policy["stop_at"], "cost_control.stop_at")
+    running = record["status"].lower() in COST_INCURRING_STATES
+    expired = checked_at >= deadline
+    if expired:
+        state = "expired-running" if running else "expired-stopped"
+    else:
+        state = "active" if running else "stopped"
+    remaining_seconds = max(0, int((deadline - checked_at).total_seconds()))
+    return {
+        **base,
+        "cost_status": state,
+        "stop_at": policy["stop_at"],
+        "seconds_remaining": remaining_seconds,
+        "hourly_rate_usd": policy["hourly_rate_usd"],
+        "max_runtime_seconds": policy["max_runtime_seconds"],
+        "max_compute_usd": policy["max_compute_usd"],
+        "projected_compute_usd": policy["projected_compute_usd"],
+        "pricing_source": policy["pricing_source"],
+        "pricing_checked_at": policy["pricing_checked_at"],
+        "guard": policy["guard"],
+    }
+
+
+def cmd_cost_status(args: argparse.Namespace) -> int:
+    path = registry_path(args.registry)
+    data = load_registry(path, create=False)
+    checked_at = utc_now().replace(microsecond=0)
+    result = {
+        "checked_at": format_utc(checked_at),
+        "path": str(path),
+        "vms": [cost_status(record, checked_at) for record in data["vms"]],
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_upsert(args: argparse.Namespace) -> int:
     path = registry_path(args.registry)
     data = load_registry(path, create=True)
@@ -870,6 +1318,7 @@ def cmd_upsert(args: argparse.Namespace) -> int:
     vm_id = str(args.id)
     index = next((i for i, vm in enumerate(data["vms"]) if vm["provider"] == provider and vm["id"] == vm_id), None)
     created_at = timestamp if index is None else data["vms"][index]["created_at"]
+    policy = cost_control_from_args(args)
     record: VMRecord = {
         "provider": provider,
         "id": vm_id,
@@ -887,6 +1336,12 @@ def cmd_upsert(args: argparse.Namespace) -> int:
         "created_at": created_at,
         "checked_at": timestamp,
     }
+    if policy is not None:
+        record["cost_control"] = policy
+    elif index is not None:
+        existing_policy = data["vms"][index].get("cost_control")
+        if existing_policy is not None:
+            record["cost_control"] = existing_policy
     if index is None:
         data["vms"].append(record)
         action = "created"
@@ -1011,11 +1466,44 @@ def parser() -> argparse.ArgumentParser:
     github_install.add_argument("--id", required=True)
     github_install.set_defaults(func=cmd_github_install_key)
 
+    plan_cost = sub.add_parser(
+        "plan-cost",
+        help="validate a compute budget and calculate an absolute stop deadline",
+    )
+    plan_cost.add_argument("--hourly-rate-usd", required=True)
+    runtime_group = plan_cost.add_mutually_exclusive_group(required=True)
+    runtime_group.add_argument("--max-runtime-hours")
+    runtime_group.add_argument("--max-runtime-seconds")
+    plan_cost.add_argument("--max-compute-usd", required=True)
+    plan_cost.add_argument("--start-at")
+    plan_cost.set_defaults(func=cmd_plan_cost)
+
+    render_cost_guard = sub.add_parser(
+        "render-cost-guard",
+        help="write cloud-init-compatible systemd auto-stop configuration",
+    )
+    render_cost_guard.add_argument("--stop-at", required=True)
+    render_cost_guard.add_argument("--output", required=True)
+    render_cost_guard.set_defaults(func=cmd_render_cost_guard)
+
+    cost_status_parser = sub.add_parser(
+        "cost-status",
+        help="audit recorded compute budgets and stop deadlines without provider calls",
+    )
+    cost_status_parser.add_argument("--registry")
+    cost_status_parser.set_defaults(func=cmd_cost_status)
+
     upsert = sub.add_parser("upsert", help="create or replace one registry record")
     upsert.add_argument("--registry")
     upsert.add_argument("--provider", choices=sorted(VALID_PROVIDERS), required=True)
     for option in ("id", "name", "location", "machine-type", "public-ip", "ssh-user", "private-key", "public-key", "cloud-key-name", "status"):
         upsert.add_argument(f"--{option}", required=True)
+    upsert.add_argument("--hourly-rate-usd")
+    upsert.add_argument("--max-runtime-seconds")
+    upsert.add_argument("--max-compute-usd")
+    upsert.add_argument("--stop-at")
+    upsert.add_argument("--pricing-source")
+    upsert.add_argument("--pricing-checked-at")
     upsert.set_defaults(func=cmd_upsert)
 
     sync = sub.add_parser("sync", help="query providers and update all registered VM states")

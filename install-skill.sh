@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-# Install/update: curl -fsSL https://raw.githubusercontent.com/paoloanzn/remote-computer/main/install-skill.sh | sh
-REPO="${REPO:-paoloanzn/remote-computer}"
+# Install/update: curl -fsSL https://raw.githubusercontent.com/aidvgg/remote-computer/main/install-skill.sh | sh
+REPO="${REPO:-aidvgg/remote-computer}"
 REF="${REF:-main}"
 SKILL_NAME="${SKILL_NAME:-remote-computer}"
 REQUESTED_AGENT="${REMOTE_COMPUTER_SKILL_AGENT:-${AGENT:-auto}}"
@@ -73,7 +73,7 @@ install_from() {
   STAGE="${destination_root%/}/.${SKILL_NAME}.new.$$"
   BACKUP="${destination_root%/}/.${SKILL_NAME}.old.$$"
 
-  for required in SKILL.md agents scripts references; do
+  for required in SKILL.md agents references scripts/vm_bookkeeper.py scripts/remote_github_setup.py; do
     if [ ! -e "$source_root/$required" ]; then
       echo "Error: missing skill component: $source_root/$required" >&2
       exit 1
@@ -84,7 +84,9 @@ install_from() {
   mkdir "$STAGE"
   cp "$source_root/SKILL.md" "$STAGE/SKILL.md"
   cp -R "$source_root/agents" "$STAGE/agents"
-  cp -R "$source_root/scripts" "$STAGE/scripts"
+  mkdir "$STAGE/scripts"
+  cp "$source_root/scripts/vm_bookkeeper.py" "$STAGE/scripts/vm_bookkeeper.py"
+  cp "$source_root/scripts/remote_github_setup.py" "$STAGE/scripts/remote_github_setup.py"
   cp -R "$source_root/references" "$STAGE/references"
 
   if [ -e "$DESTINATION" ]; then
