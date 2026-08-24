@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -78,6 +79,7 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 GITHUB_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 GITHUB_SOURCE_VALUES = {"discovered", "generated"}
 GITHUB_SSH_GREETING_RE = re.compile(r"Hi ([A-Za-z0-9][A-Za-z0-9._-]{0,62})! You've successfully authenticated")
+OPENPGP_FINGERPRINT_RE = re.compile(r"^(?:[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})$")
 
 
 def now() -> str:
@@ -757,6 +759,249 @@ def checked_subprocess(command: list[str], timeout: int = 45, input_text: str | 
     return checked_text(command, timeout=timeout, input_text=input_text)
 
 
+def local_gpg_program() -> str:
+    configured = git_config_value("gpg.program")
+    executable = command_path(configured) if configured else command_path("gpg")
+    if not executable:
+        raise RuntimeError("the locally configured OpenPGP gpg program is required")
+    return executable
+
+
+def openpgp_secret_fingerprints(gpg: str, selector: str) -> list[str]:
+    result = run_text([
+        gpg, "--batch", "--with-colons", "--fingerprint", "--list-secret-keys", selector,
+    ], timeout=20)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "OpenPGP secret-key lookup failed")
+    fingerprints: list[str] = []
+    awaiting_primary_fingerprint = False
+    for line in result.stdout.splitlines():
+        fields = line.split(":")
+        record = fields[0] if fields else ""
+        if record == "sec":
+            awaiting_primary_fingerprint = True
+        elif record == "ssb":
+            awaiting_primary_fingerprint = False
+        elif record == "fpr" and awaiting_primary_fingerprint and len(fields) > 9:
+            fingerprints.append(fields[9].upper())
+            awaiting_primary_fingerprint = False
+    return fingerprints
+
+
+def resolve_openpgp_secret_key(selector: str | None) -> tuple[str, str]:
+    gpg = local_gpg_program()
+    requested = selector or git_config_value("user.signingkey")
+    if not requested:
+        raise ValueError("an OpenPGP fingerprint or configured user.signingkey is required")
+    fingerprints = openpgp_secret_fingerprints(gpg, requested)
+    if len(fingerprints) != 1:
+        raise ValueError("the signing-key selector must resolve to exactly one local OpenPGP secret key")
+    fingerprint = fingerprints[0]
+    if not OPENPGP_FINGERPRINT_RE.fullmatch(fingerprint):
+        raise ValueError("the resolved OpenPGP fingerprint must contain 40 or 64 hexadecimal characters")
+    return gpg, fingerprint
+
+
+def normalized_commit_gpgsign(requested: str | None) -> str | None:
+    value = requested if requested is not None else git_config_value("commit.gpgsign")
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"true", "yes", "on", "1"}:
+        return "true"
+    if lowered in {"false", "no", "off", "0"}:
+        return "false"
+    raise ValueError(f"commit.gpgsign is not a valid boolean: {value}")
+
+
+def registered_vm_ssh(
+    data: Registry,
+    provider: str,
+    vm_id: str,
+) -> tuple[VMRecord, str, list[str]]:
+    vm = next((
+        record for record in data["vms"]
+        if record["provider"] == provider and record["id"] == vm_id
+    ), None)
+    if vm is None:
+        raise ValueError(f"VM not found in registry: {provider}/{vm_id}")
+    access_path = Path(vm["key_pair"]["private_path"]).expanduser()
+    if not access_path.is_file():
+        raise FileNotFoundError(f"VM access key does not exist: {access_path}")
+    if not vm["public_ip"]:
+        raise ValueError(f"VM has no public IP: {provider}/{vm_id}")
+    if not command_path("ssh"):
+        raise RuntimeError("ssh is required")
+    target = f"{vm['ssh_user']}@{vm['public_ip']}"
+    common = [
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=15",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "-i", str(access_path),
+    ]
+    return vm, target, common
+
+
+def remote_gpg_package_command() -> str:
+    return " ".join([
+        "set -eu;",
+        "if ! command -v apt-get >/dev/null 2>&1; then",
+        "echo 'automatic GPG setup currently requires an apt-based Ubuntu/Debian VM' >&2; exit 1; fi;",
+        "run_root() { if test \"$(id -u)\" -eq 0; then \"$@\"; else sudo -n \"$@\"; fi; };",
+        "if ! command -v python3 >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1 ||",
+        "! command -v gpg >/dev/null 2>&1 || ! command -v gpgconf >/dev/null 2>&1 ||",
+        "! command -v gpg-connect-agent >/dev/null 2>&1 ||",
+        "! command -v pinentry-curses >/dev/null 2>&1; then",
+        "run_root env DEBIAN_FRONTEND=noninteractive apt-get update;",
+        "run_root env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 git gnupg gpg-agent pinentry-curses; fi;",
+        "command -v python3 >/dev/null; command -v git >/dev/null;",
+        "command -v gpg >/dev/null; command -v gpgconf >/dev/null;",
+        "command -v gpg-connect-agent >/dev/null; command -v pinentry-curses >/dev/null",
+    ])
+
+
+def stream_openpgp_secret_key(gpg: str, fingerprint: str, ssh_command: list[str]) -> None:
+    environment = os.environ.copy()
+    if sys.stdin.isatty():
+        try:
+            environment["GPG_TTY"] = os.ttyname(sys.stdin.fileno())
+        except OSError:
+            pass
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as export_errors:
+        exporter = subprocess.Popen(
+            [gpg, "--export-secret-keys", fingerprint],
+            stdout=subprocess.PIPE,
+            stderr=export_errors,
+            env=environment,
+        )
+        if exporter.stdout is None:
+            exporter.kill()
+            raise RuntimeError("could not open the protected OpenPGP export stream")
+        importer = subprocess.Popen(
+            ssh_command,
+            stdin=exporter.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        exporter.stdout.close()
+        try:
+            _, import_errors = importer.communicate(timeout=180)
+            export_status = exporter.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            importer.kill()
+            exporter.kill()
+            importer.wait()
+            exporter.wait()
+            raise
+        export_errors.seek(0)
+        export_error = export_errors.read().strip()
+    import_error = import_errors.decode(errors="replace").strip()
+    if export_status:
+        raise RuntimeError(export_error or "local OpenPGP secret-key export failed")
+    if importer.returncode:
+        raise RuntimeError(import_error or "remote OpenPGP secret-key import failed")
+
+
+def signing_verification_command(target: str, common: list[str], fingerprint: str) -> list[str]:
+    remote = " ".join([
+        "set -eu;",
+        'export GPG_TTY="$(tty)";',
+        "gpg-connect-agent updatestartuptty /bye >/dev/null;",
+        "printf '%s\\n' remote-computer-signing-test |",
+        f"gpg --local-user {fingerprint} --armor --detach-sign --output - >/dev/null;",
+        "echo 'OpenPGP signing verified; gpg-agent has accepted the key unlock.'",
+    ])
+    return ["ssh", *common, "-tt", target, remote]
+
+
+def interactive_terminal() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def cmd_github_install_gpg(args: argparse.Namespace) -> int:
+    path = registry_path(args.registry)
+    data = load_registry(path, create=False)
+    provider = str(args.provider)
+    vm_id = str(args.id)
+    _, target, common = registered_vm_ssh(data, provider, vm_id)
+    signing_format = (git_config_value("gpg.format") or "openpgp").lower()
+    if signing_format != "openpgp":
+        raise ValueError(
+            f"github-install-gpg only ports OpenPGP keys; configured gpg.format is {signing_format}"
+        )
+    gpg, fingerprint = resolve_openpgp_secret_key(args.fingerprint)
+    commit_gpgsign = normalized_commit_gpgsign(args.commit_gpgsign)
+    setup_script = Path(__file__).with_name("remote_gpg_setup.py")
+    if not setup_script.is_file():
+        raise FileNotFoundError(f"remote GPG setup helper does not exist: {setup_script}")
+    setup_source = setup_script.read_text(encoding="utf-8")
+
+    checked_subprocess(
+        ["ssh", *common, target, remote_gpg_package_command()],
+        timeout=300,
+    )
+    checked_subprocess([
+        "ssh", *common, target, "python3", "-", "--fingerprint", fingerprint, "--preflight",
+    ], timeout=60, input_text=setup_source)
+    stream_openpgp_secret_key(
+        gpg,
+        fingerprint,
+        [
+            "ssh", *common, target,
+            "umask 077; mkdir -p ~/.gnupg; chmod 700 ~/.gnupg; gpg --batch --import",
+        ],
+    )
+
+    setup_command = [
+        "ssh", *common, target, "python3", "-", "--fingerprint", fingerprint,
+    ]
+    if commit_gpgsign is not None:
+        setup_command.extend(["--commit-gpgsign", commit_gpgsign])
+    setup_output = checked_subprocess(
+        setup_command,
+        timeout=60,
+        input_text=setup_source,
+    )
+    verify = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "github-verify-gpg",
+        "--provider", provider,
+        "--id", vm_id,
+        "--fingerprint", fingerprint,
+    ]
+    if args.registry:
+        verify.extend(["--registry", str(args.registry)])
+    print(json.dumps({
+        "fingerprint": fingerprint,
+        "id": vm_id,
+        "provider": provider,
+        "remote_setup": json.loads(setup_output),
+        "secret_transfer": "streamed-over-ssh",
+        "verification_command": shlex.join(verify),
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_github_verify_gpg(args: argparse.Namespace) -> int:
+    path = registry_path(args.registry)
+    data = load_registry(path, create=False)
+    provider = str(args.provider)
+    vm_id = str(args.id)
+    _, target, common = registered_vm_ssh(data, provider, vm_id)
+    _, fingerprint = resolve_openpgp_secret_key(args.fingerprint)
+    command = signing_verification_command(target, common, fingerprint)
+    if not interactive_terminal():
+        raise RuntimeError(
+            "interactive GPG verification requires a real terminal; run: " + shlex.join(command)
+        )
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        raise RuntimeError(f"interactive remote OpenPGP signing test failed with exit {result.returncode}")
+    return 0
+
+
 def cmd_github_install_key(args: argparse.Namespace) -> int:
     host = str(args.host)
     account = str(args.account)
@@ -1010,6 +1255,37 @@ def parser() -> argparse.ArgumentParser:
     github_install.add_argument("--provider", choices=sorted(VALID_PROVIDERS), required=True)
     github_install.add_argument("--id", required=True)
     github_install.set_defaults(func=cmd_github_install_key)
+
+    github_install_gpg = sub.add_parser(
+        "github-install-gpg",
+        help="stream an OpenPGP signing key to a VM and configure terminal pinentry",
+    )
+    github_install_gpg.add_argument("--registry")
+    github_install_gpg.add_argument("--provider", choices=sorted(VALID_PROVIDERS), required=True)
+    github_install_gpg.add_argument("--id", required=True)
+    github_install_gpg.add_argument(
+        "--fingerprint",
+        help="local OpenPGP secret-key fingerprint; defaults to user.signingkey",
+    )
+    github_install_gpg.add_argument(
+        "--commit-gpgsign",
+        choices=("true", "false"),
+        help="override the local commit.gpgsign value on the VM",
+    )
+    github_install_gpg.set_defaults(func=cmd_github_install_gpg)
+
+    github_verify_gpg = sub.add_parser(
+        "github-verify-gpg",
+        help="unlock and test an installed OpenPGP signing key through an interactive remote PTY",
+    )
+    github_verify_gpg.add_argument("--registry")
+    github_verify_gpg.add_argument("--provider", choices=sorted(VALID_PROVIDERS), required=True)
+    github_verify_gpg.add_argument("--id", required=True)
+    github_verify_gpg.add_argument(
+        "--fingerprint",
+        help="local OpenPGP secret-key fingerprint; defaults to user.signingkey",
+    )
+    github_verify_gpg.set_defaults(func=cmd_github_verify_gpg)
 
     upsert = sub.add_parser("upsert", help="create or replace one registry record")
     upsert.add_argument("--registry")

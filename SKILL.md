@@ -119,7 +119,7 @@ Prefer strategies in this order:
 
 Never generate the shared GitHub key on an individual VM. Keep it separate from each VM's access key under `~/.ssh/remote-computer/github/`. Do not use the shared GitHub key for cloud login. Do not use the cloud-login key for GitHub.
 
-If commit signing is requested, preserve its original format and fingerprint. OpenPGP secret-key transfer and SSH signing are covered in `references/github.md`. Configuring GitHub authentication must not unset or replace `user.signingkey`, `commit.gpgsign`, or existing GPG material.
+If commit signing is requested, preserve its original format and fingerprint. OpenPGP secret-key transfer and SSH signing are covered in `references/github.md`. For OpenPGP, show the full fingerprint and obtain explicit confirmation, then use `github-install-gpg`; it streams only that protected secret key, installs terminal pinentry support, and returns a `github-verify-gpg` command that the user must run in a real terminal to unlock the key through a forced remote PTY. Never request or handle the passphrase. Configuring GitHub authentication must not unset or replace `user.signingkey`, `commit.gpgsign`, or existing GPG material.
 
 Verify GitHub SSH authentication and repository access before claiming success. GitHub's successful `ssh -T git@github.com` greeting normally exits with status 1 because GitHub provides no shell; evaluate the greeting, not the exit status alone.
 
