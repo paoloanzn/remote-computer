@@ -119,8 +119,36 @@ GitHub normally returns a successful authentication greeting with exit status 1 
 
 Set the discovered name/email on the VM only after user confirmation. Preserve absent values rather than inventing them.
 
-For OpenPGP signing, verify the configured local signing fingerprint, then stream only that secret key directly through the encrypted VM SSH connection into `gpg --import`; do not create a plaintext export file and do not copy the entire `~/.gnupg` directory. Keep the existing key passphrase protection. Configure the VM's native GPG path, `user.signingkey`, `gpg.format=openpgp`, `commit.gpgsign`, and `GPG_TTY`. Verify the imported fingerprint without printing secret packets.
+For OpenPGP signing, first show the resolved full fingerprint and obtain explicit confirmation to copy that secret key. Then run:
+
+```bash
+python3 scripts/vm_bookkeeper.py github-install-gpg \
+  --provider <aws|gcp> --id <provider-native-vm-id> \
+  --fingerprint <full-openpgp-fingerprint>
+```
+
+The command is intentionally limited to apt-based Ubuntu/Debian VMs, including the default Ubuntu 24.04 image. It:
+
+1. Verifies that the selector resolves to exactly one local OpenPGP secret-key fingerprint.
+2. Installs `python3`, `git`, `gnupg`, `gpg-agent`, and `pinentry-curses` remotely as root or with non-interactive, passwordless `sudo`; it stops if the VM is not apt-based or requires an interactive sudo password.
+3. Preflights the remote pinentry and Git signing configuration before transferring secret material. It refuses to replace a conflicting unmanaged `pinentry-program`, `gpg.format`, or `user.signingkey`.
+4. Pipes `gpg --export-secret-keys` directly into remote `gpg --import` over the encrypted SSH connection. It never creates a plaintext export file, copies `~/.gnupg`, or includes a passphrase in an argument, log, or registry record. The local GPG agent may display the user's existing local pinentry while exporting; the user enters the passphrase there, never into the agent conversation.
+5. Verifies the imported primary fingerprint exactly and preserves the key's existing passphrase protection.
+6. Configures the VM's native GPG path, `user.signingkey`, `gpg.format=openpgp`, and the existing local `commit.gpgsign` value. `--commit-gpgsign true|false` may explicitly override that copied boolean.
+7. Adds a managed `pinentry-program` entry for `pinentry-curses` to `~/.gnupg/gpg-agent.conf`, without deleting other agent settings or overriding a conflicting unmanaged pinentry choice.
+8. Adds idempotent managed `GPG_TTY` and `gpg-connect-agent updatestartuptty` blocks to `~/.profile` and `~/.bashrc`, preserving their prior contents and file modes, then restarts `gpg-agent`.
+9. Prints the separate interactive verification command.
+
+Run the printed command in a real local terminal:
+
+```bash
+python3 scripts/vm_bookkeeper.py github-verify-gpg \
+  --provider <aws|gcp> --id <provider-native-vm-id> \
+  --fingerprint <full-openpgp-fingerprint>
+```
+
+Verification refuses redirected/non-terminal input, forces an SSH PTY with `-tt`, refreshes the agent's startup TTY, and creates a disposable detached signature entirely through standard input/output. For a protected key, `pinentry-curses` displays in that terminal and the user enters the existing passphrase directly. A successful test confirms that `gpg-agent` accepted the unlock and can cache it according to the agent's existing cache policy. The workflow never asks the user to send the passphrase to the agent.
 
 For SSH commit signing (`gpg.format=ssh`), treat the signing key path as independent from GitHub authentication. Reuse the same key for both roles only when the user explicitly confirms that choice and GitHub has the public key registered with both appropriate key types.
 
-Never unset or delete the user's existing GPG key while adding GitHub SSH authentication. A signing verification test may require the user to enter the existing passphrase directly in the VM terminal; never ask them to send it to the agent.
+Never unset or delete the user's existing GPG key while adding GitHub SSH authentication. Never run `github-install-gpg` for `gpg.format=ssh`; use the separate SSH signing-key procedure instead.

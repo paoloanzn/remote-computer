@@ -22,7 +22,7 @@ Ask the agent to use `$remote-computer`, for example: “Use `$remote-computer` 
 | Heavy | `t3.2xlarge` · 8 vCPU · 32 GiB | `e2-standard-8` · 8 vCPU · 32 GiB |
 | Free Tier allowance | — | eligible `e2-micro` usage in selected US regions; limits apply |
 
-Requirements: Python 3.10+, `ssh-keygen`, `ssh`, `scp`, and at least one configured provider CLI (`aws` or `gcloud`). GitHub configuration discovery uses local Git/GPG/SSH metadata and optionally `gh`; it never reads token values or private-key contents. Clipboard handoff uses `pbcopy` on macOS or `wl-copy`, `xclip`, or `xsel` on Linux, with a printed-command fallback.
+Requirements: Python 3.10+, `ssh-keygen`, `ssh`, `scp`, and at least one configured provider CLI (`aws` or `gcloud`). GitHub configuration discovery uses local Git/GPG/SSH metadata and optionally `gh`; it never reads token values or private-key contents. OpenPGP signing transfer additionally requires local GnuPG and an apt-based Ubuntu/Debian VM with passwordless sudo. It installs remote `gnupg`, `gpg-agent`, and `pinentry-curses`, streams the selected protected key without a plaintext export, and verifies unlocking through a forced interactive SSH PTY. Clipboard handoff uses `pbcopy` on macOS or `wl-copy`, `xclip`, or `xsel` on Linux, with a printed-command fallback.
 
 ## Safety and state
 
@@ -34,6 +34,8 @@ Provider and credential procedures live in [`references/aws.md`](references/aws.
 python3 scripts/vm_bookkeeper.py doctor
 python3 scripts/vm_bookkeeper.py init
 python3 scripts/vm_bookkeeper.py github-discover --verify-ssh
+python3 scripts/vm_bookkeeper.py github-install-gpg --provider aws --id i-example --fingerprint FULL_FINGERPRINT
+python3 scripts/vm_bookkeeper.py github-verify-gpg --provider aws --id i-example --fingerprint FULL_FINGERPRINT
 python3 scripts/vm_bookkeeper.py sync
 ```
 

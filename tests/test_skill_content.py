@@ -46,6 +46,10 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("GitHub authentication", github)
         self.assertIn("Commit signing", github)
         self.assertIn("github-upload-key", github)
+        self.assertIn("github-install-gpg", github)
+        self.assertIn("github-verify-gpg", github)
+        self.assertIn("pinentry-curses", github)
+        self.assertIn("gpg-agent", github)
         self.assertIn("Never replace or remove signing configuration", github)
 
     def test_default_prompt_names_skill(self):

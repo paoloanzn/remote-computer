@@ -27,6 +27,7 @@ def load_module(name: str, path: Path):
 
 book = load_module("vm_bookkeeper", SKILL_ROOT / "scripts" / "vm_bookkeeper.py")
 remote = load_module("remote_github_setup", SKILL_ROOT / "scripts" / "remote_github_setup.py")
+remote_gpg = load_module("remote_gpg_setup", SKILL_ROOT / "scripts" / "remote_gpg_setup.py")
 
 
 def make_key(path: Path, comment: str = "test@example") -> None:
@@ -255,6 +256,59 @@ class RemoteSetupTests(unittest.TestCase):
             remote.update_ssh_config(config, "github.com", "octocat", self.root / "new-key")
 
 
+class RemoteGpgSetupTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_pinentry_and_tty_configuration_are_idempotent(self) -> None:
+        agent = self.root / "gpg-agent.conf"
+        agent.write_text("default-cache-ttl 900\n")
+        profile = self.root / ".profile"
+        profile.write_text("export EDITOR=vi\n")
+        os.chmod(profile, 0o644)
+
+        for _ in range(2):
+            remote_gpg.ensure_pinentry_config(agent, "/usr/bin/pinentry-curses")
+            remote_gpg.configure_tty_startup(profile)
+
+        self.assertIn("default-cache-ttl 900", agent.read_text())
+        self.assertIn("pinentry-program /usr/bin/pinentry-curses", agent.read_text())
+        self.assertEqual(agent.read_text().count(remote_gpg.AGENT_START), 1)
+        self.assertIn('export GPG_TTY="$(tty)"', profile.read_text())
+        self.assertIn("updatestartuptty", profile.read_text())
+        self.assertEqual(profile.read_text().count(remote_gpg.TTY_START), 1)
+        self.assertEqual(os.stat(profile).st_mode & 0o777, 0o644)
+
+    def test_unmanaged_pinentry_program_is_not_overwritten(self) -> None:
+        agent = self.root / "gpg-agent.conf"
+        agent.write_text("pinentry-program /custom/pinentry\n")
+        with self.assertRaisesRegex(RuntimeError, "unmanaged pinentry-program"):
+            remote_gpg.ensure_pinentry_config(agent, "/usr/bin/pinentry-curses")
+        self.assertEqual(agent.read_text(), "pinentry-program /custom/pinentry\n")
+
+    @mock.patch.object(remote_gpg, "run")
+    def test_secret_fingerprint_parser_ignores_signing_subkey(self, run: mock.MagicMock) -> None:
+        primary = "A" * 40
+        subkey = "B" * 40
+        run.return_value = "\n".join([
+            "sec:-:255:22:key:0:0:::::::",
+            f"fpr:::::::::{primary}:",
+            "ssb:-:255:22:sub:0:0:::::::",
+            f"fpr:::::::::{subkey}:",
+        ])
+        self.assertEqual(remote_gpg.secret_fingerprints("gpg", primary), [primary])
+
+    @mock.patch.object(remote_gpg, "git_config")
+    def test_existing_different_remote_signing_key_is_not_replaced(self, config: mock.MagicMock) -> None:
+        config.side_effect = ["openpgp", "B" * 40]
+        with self.assertRaisesRegex(RuntimeError, "refusing to replace remote user.signingkey"):
+            remote_gpg.check_existing_signing_config("git", "A" * 40)
+
+
 class GithubInstallTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -345,6 +399,130 @@ class GithubInstallTests(unittest.TestCase):
             book.cmd_github_install_key(args)
         data = book.load_registry(self.registry)
         self.assertEqual(data["github_auth"][0]["installed_on"], [])
+
+
+class GpgInstallTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.registry = self.root / "registry.json"
+        self.vm_key = self.root / "vm-key"
+        make_key(self.vm_key, "vm")
+        timestamp = "2026-01-01T00:00:00+00:00"
+        data = book.empty_registry()
+        data["vms"] = [{
+            "provider": "aws",
+            "id": "i-test",
+            "name": "test",
+            "location": "us-east-1",
+            "machine_type": "t3.medium",
+            "public_ip": "203.0.113.10",
+            "ssh_user": "ubuntu",
+            "key_pair": {
+                "private_path": str(self.vm_key),
+                "public_path": f"{self.vm_key}.pub",
+                "cloud_name": "test",
+            },
+            "status": "running",
+            "created_at": timestamp,
+            "checked_at": timestamp,
+        }]
+        book.save_registry(self.registry, data)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    @mock.patch.object(book, "stream_openpgp_secret_key")
+    @mock.patch.object(book, "checked_subprocess")
+    @mock.patch.object(book, "resolve_openpgp_secret_key")
+    @mock.patch.object(book, "git_config_value", return_value=None)
+    def test_install_adds_pinentry_streams_key_and_returns_interactive_verification(
+        self,
+        _git_config: mock.MagicMock,
+        resolve: mock.MagicMock,
+        checked: mock.MagicMock,
+        stream: mock.MagicMock,
+    ) -> None:
+        fingerprint = "A" * 40
+        resolve.return_value = ("/usr/bin/gpg", fingerprint)
+        checked.side_effect = ["", json.dumps({
+            "fingerprint": fingerprint,
+            "pinentry_program": "/usr/bin/pinentry-curses",
+            "preflight": True,
+        }), json.dumps({
+            "fingerprint": fingerprint,
+            "pinentry_program": "/usr/bin/pinentry-curses",
+            "verified": True,
+        })]
+        args = argparse.Namespace(
+            registry=str(self.registry),
+            provider="aws",
+            id="i-test",
+            fingerprint=fingerprint,
+            commit_gpgsign="true",
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(book.cmd_github_install_gpg(args), 0)
+
+        package_command = cast(list[str], checked.call_args_list[0].args[0])[-1]
+        self.assertIn("apt-get install -y python3 git gnupg gpg-agent pinentry-curses", package_command)
+        preflight_command = cast(list[str], checked.call_args_list[1].args[0])
+        self.assertIn("--preflight", preflight_command)
+        stream.assert_called_once()
+        stream_command = cast(list[str], stream.call_args.args[2])[-1]
+        self.assertIn("gpg --batch --import", stream_command)
+        setup_command = cast(list[str], checked.call_args_list[2].args[0])
+        self.assertIn("--commit-gpgsign", setup_command)
+        result = json.loads(output.getvalue())
+        self.assertEqual(result["secret_transfer"], "streamed-over-ssh")
+        self.assertIn("github-verify-gpg", result["verification_command"])
+
+    @mock.patch.object(book.subprocess, "run")
+    @mock.patch.object(book, "interactive_terminal", return_value=True)
+    @mock.patch.object(book, "resolve_openpgp_secret_key")
+    def test_verify_forces_pty_and_updates_agent_tty_before_signing(
+        self,
+        resolve: mock.MagicMock,
+        _interactive: mock.MagicMock,
+        run: mock.MagicMock,
+    ) -> None:
+        fingerprint = "A" * 40
+        resolve.return_value = ("/usr/bin/gpg", fingerprint)
+        run.return_value = subprocess.CompletedProcess(args=[], returncode=0)
+        args = argparse.Namespace(
+            registry=str(self.registry),
+            provider="aws",
+            id="i-test",
+            fingerprint=fingerprint,
+        )
+        self.assertEqual(book.cmd_github_verify_gpg(args), 0)
+        command = cast(list[str], run.call_args.args[0])
+        self.assertIn("-tt", command)
+        self.assertIn("updatestartuptty", command[-1])
+        self.assertIn("--detach-sign", command[-1])
+        self.assertNotIn("passphrase", " ".join(command).lower())
+
+    @mock.patch.object(book.subprocess, "Popen")
+    def test_secret_export_is_piped_directly_without_plaintext_file(self, popen: mock.MagicMock) -> None:
+        exporter = mock.MagicMock()
+        exporter.stdout = io.BytesIO(b"protected-secret-key-packets")
+        exporter.wait.return_value = 0
+        importer = mock.MagicMock()
+        importer.communicate.return_value = (b"", b"")
+        importer.returncode = 0
+        popen.side_effect = [exporter, importer]
+        fingerprint = "A" * 40
+
+        book.stream_openpgp_secret_key(
+            "/usr/bin/gpg",
+            fingerprint,
+            ["ssh", "ubuntu@example", "gpg --batch --import"],
+        )
+
+        export_command = cast(list[str], popen.call_args_list[0].args[0])
+        self.assertEqual(export_command, ["/usr/bin/gpg", "--export-secret-keys", fingerprint])
+        self.assertIs(popen.call_args_list[1].kwargs["stdin"], exporter.stdout)
 
 
 if __name__ == "__main__":
