@@ -73,7 +73,7 @@ install_from() {
   STAGE="${destination_root%/}/.${SKILL_NAME}.new.$$"
   BACKUP="${destination_root%/}/.${SKILL_NAME}.old.$$"
 
-  for required in SKILL.md agents scripts references; do
+  for required in SKILL.md agents scripts references assets; do
     if [ ! -e "$source_root/$required" ]; then
       echo "Error: missing skill component: $source_root/$required" >&2
       exit 1
@@ -86,6 +86,7 @@ install_from() {
   cp -R "$source_root/agents" "$STAGE/agents"
   cp -R "$source_root/scripts" "$STAGE/scripts"
   cp -R "$source_root/references" "$STAGE/references"
+  cp -R "$source_root/assets" "$STAGE/assets"
 
   if [ -e "$DESTINATION" ]; then
     mv "$DESTINATION" "$BACKUP"

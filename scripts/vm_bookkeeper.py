@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import ipaddress
 import json
 import os
 import platform
@@ -13,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict, cast
@@ -73,9 +76,196 @@ class Registry(RegistryRequired, total=False):
     github_auth: list[GithubAuthRecord]
 
 
+class ContainerHost(TypedDict):
+    platform: str
+    machine: str
+    macos_version: str | None
+    chip: str | None
+    cpus: int
+    performance_cores: int | None
+    efficiency_cores: int | None
+    memory_bytes: int
+    disk_free_bytes: int
+    disk_path: str
+
+
+class TierProfile(TypedDict):
+    memory_fraction: float
+    memory_min_gib: int
+    memory_max_gib: int
+    disk_min_gib: int
+    disk_gib: int
+    disk_max_gib: int
+
+
+class ResourcePlan(TypedDict):
+    tier: str
+    cpus: int
+    cpus_range: list[int]
+    memory_gib: int
+    disk_gib: int
+    disk_range_gib: list[int]
+    image_estimate_gib: int
+    warnings: list[str]
+
+
+class DefaultContainerConfig(TypedDict):
+    tier: str
+    title: str
+    workload: str
+    toolchains: list[str]
+    image_estimate_gib: int
+
+
+class ContainerConfigEntry(TypedDict):
+    kind: str
+    tier: str
+    source: str
+    context: str
+    sha256: str
+    updated_at: str
+
+
+class ContainerManifest(TypedDict):
+    version: int
+    configs: dict[str, ContainerConfigEntry]
+
+
+class DockerfileAnalysis(TypedDict):
+    final_base_image: str | None
+    base_family: str
+    languages: list[str]
+    services: list[str]
+    heavy_signals: list[str]
+    tier: str
+    reasons: list[str]
+    warnings: list[str]
+    uses_build_context: bool
+    exposed_ports: list[str]
+    ssh_layer: str
+
+
+class ContainerState(TypedDict):
+    id: str
+    state: str
+    ip: str | None
+    network: str | None
+    image: str | None
+    cpus: int | None
+    memory_bytes: int | None
+
+
 SCHEMA_VERSION = 1
-VALID_PROVIDERS = {"aws", "gcp"}
+CONTAINER_PROVIDER = "apple-container"
+VALID_PROVIDERS = {"aws", "gcp", CONTAINER_PROVIDER}
+PROVIDER_CLIS = {"aws": "aws", "gcp": "gcloud", CONTAINER_PROVIDER: "container"}
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
+CONTAINER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,62}$")
+CONTAINER_MIN_VERSION = (1, 0, 0)
+CONTAINER_VERSION_RE = re.compile(r"version (\d+)\.(\d+)\.(\d+)")
+CONTAINER_MANIFEST_NAME = ".remote-computer.json"
+CONTAINER_MANIFEST_VERSION = 1
+CONTAINER_HOST_KEY = "/home/.remote-computer/ssh-host-keys/ssh_host_ed25519_key.pub"
+SSH_LAYER_BEGIN = "# >>> remote-computer managed SSH layer >>>"
+SSH_LAYER_END = "# <<< remote-computer managed SSH layer <<<"
+GIB = 1024 ** 3
+MEMORY_CEILING_NOTE = (
+    "apple/container treats --memory as the VM's ceiling: the VM only takes host memory as the "
+    "workload touches it. Pages freed inside Linux are not returned to macOS until the container "
+    "restarts, so restart long-lived containers after memory-heavy jobs."
+)
+DISK_CEILING_NOTE = (
+    "The workspace disk is a sparse, size-capped named volume mounted at /home; it consumes host "
+    "disk only as data is written. The image and system packages live in the container root "
+    "filesystem, which apple/container does not cap per container."
+)
+TIER_PROFILES: dict[str, TierProfile] = {
+    "light": {
+        "memory_fraction": 0.25, "memory_min_gib": 2, "memory_max_gib": 8,
+        "disk_min_gib": 15, "disk_gib": 20, "disk_max_gib": 25,
+    },
+    "standard": {
+        "memory_fraction": 0.375, "memory_min_gib": 3, "memory_max_gib": 16,
+        "disk_min_gib": 30, "disk_gib": 40, "disk_max_gib": 40,
+    },
+    "heavy": {
+        "memory_fraction": 0.5, "memory_min_gib": 4, "memory_max_gib": 32,
+        "disk_min_gib": 60, "disk_gib": 80, "disk_max_gib": 100,
+    },
+}
+DEFAULT_CONTAINER_CONFIGS: dict[str, DefaultContainerConfig] = {
+    "essentials": {
+        "tier": "light",
+        "title": "Essentials",
+        "workload": "Scripting, editing, and small single-language projects",
+        "toolchains": ["Git", "Python 3", "GCC/Make", "common CLI tools"],
+        "image_estimate_gib": 1,
+    },
+    "polyglot": {
+        "tier": "standard",
+        "title": "Polyglot",
+        "workload": "General multi-language development and medium builds",
+        "toolchains": ["Python 3 + uv", "Node.js LTS", "Go", "Rust", "Java 21 + Maven", "CMake"],
+        "image_estimate_gib": 4,
+    },
+    "fullstack": {
+        "tier": "heavy",
+        "title": "Full stack",
+        "workload": "Large native builds and multi-service stacks with local databases",
+        "toolchains": [
+            "everything in Polyglot", "Clang/LLVM", "Ninja", "ccache", "GDB/Valgrind",
+            "PostgreSQL", "Redis",
+        ],
+        "image_estimate_gib": 5,
+    },
+}
+CUSTOM_IMAGE_ESTIMATES_GIB = {"light": 1, "standard": 4, "heavy": 6}
+LANGUAGE_PATTERNS: dict[str, re.Pattern[str]] = {
+    "python": re.compile(r"\b(?:python[0-9.]*|pip3?|pipx|uv|poetry|conda|mamba)\b"),
+    "node": re.compile(r"\b(?:node(?:js)?|npm|npx|yarn|pnpm|corepack|bun)\b"),
+    "go": re.compile(r"\b(?:golang|go\.dev|/usr/local/go)\b|\bgo (?:build|install|mod)\b"),
+    "rust": re.compile(r"\b(?:rust|rustup|rustc|cargo)\b"),
+    "java": re.compile(r"\b(?:java|openjdk|jdk|jre|temurin|corretto|maven|mvn|gradle|kotlin|scala|sbt)\b"),
+    "dotnet": re.compile(r"\b(?:dotnet|nuget)\b"),
+    "ruby": re.compile(r"\b(?:ruby|bundler|rails)\b"),
+    "php": re.compile(r"\b(?:php|composer)\b"),
+    "c/c++": re.compile(r"\b(?:clang|cmake|ninja(?:-build)?|llvm|bazel)\b"),
+    "elixir": re.compile(r"\b(?:elixir|erlang|rebar3)\b"),
+    "haskell": re.compile(r"\b(?:ghc|ghcup|cabal|haskell)\b"),
+    "swift": re.compile(r"\bswift\b"),
+    "deno": re.compile(r"\bdeno\b"),
+    "zig": re.compile(r"\bzig\b"),
+}
+COMPILED_LANGUAGES = {"rust", "java", "dotnet", "c/c++", "haskell", "swift"}
+SERVICE_PATTERNS: dict[str, re.Pattern[str]] = {
+    "postgresql": re.compile(r"\bpostgres(?:ql)?\b(?!-client)"),
+    "mysql": re.compile(r"\b(?:mysql|mariadb)(?:-server)?\b(?!-client)"),
+    "redis": re.compile(r"\bredis(?:-server)?\b(?!-tools)"),
+    "mongodb": re.compile(r"\bmongo(?:db|d)?\b"),
+    "search": re.compile(r"\b(?:elasticsearch|opensearch)\b"),
+    "kafka": re.compile(r"\bkafka\b"),
+    "rabbitmq": re.compile(r"\brabbitmq\b"),
+    "nginx": re.compile(r"\bnginx\b"),
+    "memcached": re.compile(r"\bmemcached\b"),
+    "clickhouse": re.compile(r"\bclickhouse\b"),
+}
+HEAVY_PATTERNS: dict[str, re.Pattern[str]] = {
+    "browser-automation": re.compile(r"\b(?:chromium|google-chrome|playwright|puppeteer|selenium|firefox)\b"),
+    "machine-learning": re.compile(r"\b(?:cuda|torch|pytorch|tensorflow|jax|jupyter(?:lab)?|transformers)\b"),
+    "android": re.compile(r"\bandroid\b"),
+    "nested-containers": re.compile(r"\b(?:docker(?:-ce)?|podman|containerd)\b"),
+}
+APT_BASE_NAMES = {
+    "ubuntu", "debian", "buildpack-deps", "python", "node", "golang", "rust", "openjdk",
+    "eclipse-temurin", "maven", "gradle", "ruby", "php", "perl", "gcc", "haskell", "elixir",
+    "erlang", "swift", "julia", "r-base", "sdk", "base", "cuda",
+}
+NON_APT_BASE_NAMES = {
+    "fedora", "centos", "rockylinux", "almalinux", "amazonlinux", "oraclelinux", "ubi8", "ubi9",
+    "ubi10", "opensuse", "leap", "tumbleweed", "archlinux", "photon", "amazoncorretto", "busybox",
+    "distroless", "scratch", "wolfi-base", "chainguard",
+}
+NON_APT_TAG_MARKERS = ("alpine", "ubi", "rockylinux", "almalinux", "amazonlinux", "oraclelinux", "fedora", "distroless")
 GITHUB_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 GITHUB_SOURCE_VALUES = {"discovered", "generated"}
 GITHUB_SSH_GREETING_RE = re.compile(r"Hi ([A-Za-z0-9][A-Za-z0-9._-]{0,62})! You've successfully authenticated")
@@ -354,7 +544,7 @@ def clipboard_tool() -> tuple[str, list[str]] | None:
     return None
 
 
-def run_json(command: list[str]) -> dict[str, object]:
+def run_json_value(command: list[str]) -> object:
     result = subprocess.run(command, text=True, capture_output=True, check=False, timeout=45)
     if result.returncode:
         message = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
@@ -363,6 +553,11 @@ def run_json(command: list[str]) -> dict[str, object]:
         value: object = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         raise RuntimeError("provider CLI returned invalid JSON") from exc
+    return value
+
+
+def run_json(command: list[str]) -> dict[str, object]:
+    value = run_json_value(command)
     if not isinstance(value, dict):
         raise RuntimeError("provider CLI returned a non-object JSON value")
     return cast(dict[str, object], value)
@@ -419,12 +614,583 @@ def gcp_state(record: VMRecord) -> tuple[str, str | None]:
     return status, optional_string(access_config.get("natIP"))
 
 
+def optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def parse_container_list(payload: object) -> dict[str, ContainerState]:
+    """Parse `container list --all --format json` from apple/container 1.x (and 0.x snapshots)."""
+    states: dict[str, ContainerState] = {}
+    for index, raw_item in enumerate(object_list(payload, "containers")):
+        item = object_dict(raw_item, f"containers[{index}]")
+        configuration = object_dict(item.get("configuration", {}), "configuration")
+        container_id = optional_string(item.get("id")) or optional_string(configuration.get("id"))
+        if not container_id:
+            raise RuntimeError("container CLI returned an entry without an id")
+        raw_status = item.get("status")
+        if isinstance(raw_status, dict):
+            status = cast(dict[str, object], raw_status)
+            state = optional_string(status.get("state"))
+            raw_networks = status.get("networks", [])
+        else:
+            state = optional_string(raw_status)
+            raw_networks = item.get("networks", [])
+        ip: str | None = None
+        network: str | None = None
+        networks = object_list(raw_networks, "networks")
+        if networks:
+            attachment = object_dict(networks[0], "networks[0]")
+            address = optional_string(attachment.get("ipv4Address")) or optional_string(attachment.get("address"))
+            ip = address.split("/", 1)[0] if address else None
+            network = optional_string(attachment.get("network"))
+        image = configuration.get("image")
+        resources = configuration.get("resources")
+        image_reference = (
+            optional_string(cast(dict[str, object], image).get("reference")) if isinstance(image, dict) else None
+        )
+        resource_values = cast(dict[str, object], resources) if isinstance(resources, dict) else {}
+        states[container_id] = {
+            "id": container_id,
+            "state": (state or "unknown").lower(),
+            "ip": ip,
+            "network": network,
+            "image": image_reference,
+            "cpus": optional_int(resource_values.get("cpus")),
+            "memory_bytes": optional_int(resource_values.get("memoryInBytes")),
+        }
+    return states
+
+
+def container_states() -> dict[str, ContainerState]:
+    return parse_container_list(run_json_value(["container", "list", "--all", "--format", "json"]))
+
+
+def container_state(record: VMRecord, cache: dict[str, ContainerState] | None) -> tuple[str, str | None]:
+    states = cache if cache is not None else container_states()
+    found = states.get(record["id"])
+    if found is None:
+        return "missing", None
+    return found["state"], found["ip"]
+
+
+def host_key_alias(provider: str, vm_id: str) -> str | None:
+    """Return a stable known_hosts alias for VMs whose address is reused across instances."""
+    return f"remote-computer.{provider}.{vm_id}" if provider == CONTAINER_PROVIDER else None
+
+
+def ssh_login_command(vm: VMRecord) -> list[str]:
+    command = ["ssh", "-o", "IdentitiesOnly=yes"]
+    alias = host_key_alias(vm["provider"], vm["id"])
+    if alias:
+        command.extend(["-o", f"HostKeyAlias={alias}"])
+    command.extend(["-i", vm["key_pair"]["private_path"], f"{vm['ssh_user']}@{vm['public_ip']}"])
+    return command
+
+
+def validate_container_name(name: str) -> None:
+    if not CONTAINER_NAME_RE.fullmatch(name):
+        raise ValueError("container names must use 2-63 letters, digits, dots, underscores, or hyphens")
+
+
+def clamp(value: int, low: int, high: int) -> int:
+    low = min(low, high)
+    return max(low, min(value, high))
+
+
+def sysctl_value(name: str) -> str | None:
+    if not command_path("sysctl"):
+        return None
+    result = run_text(["sysctl", "-n", name], timeout=10)
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def sysctl_int(name: str) -> int | None:
+    value = sysctl_value(name)
+    return int(value) if value and value.isdigit() else None
+
+
+def physical_memory_bytes() -> int:
+    if platform.system() == "Darwin":
+        return sysctl_int("hw.memsize") or 0
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, OSError, ValueError):
+        return 0
+
+
+def detect_container_host() -> ContainerHost:
+    darwin = platform.system() == "Darwin"
+    data_root = Path.home() / "Library" / "Application Support" / "com.apple.container"
+    disk_path = data_root if data_root.is_dir() else Path.home()
+    return {
+        "platform": platform.system().lower(),
+        "machine": platform.machine().lower(),
+        "macos_version": platform.mac_ver()[0] or None,
+        "chip": sysctl_value("machdep.cpu.brand_string") if darwin else None,
+        "cpus": (sysctl_int("hw.ncpu") if darwin else None) or os.cpu_count() or 1,
+        "performance_cores": sysctl_int("hw.perflevel0.physicalcpu") if darwin else None,
+        "efficiency_cores": sysctl_int("hw.perflevel1.physicalcpu") if darwin else None,
+        "memory_bytes": physical_memory_bytes(),
+        "disk_free_bytes": shutil.disk_usage(disk_path).free,
+        "disk_path": str(disk_path),
+    }
+
+
+def container_host_support(host: ContainerHost) -> tuple[str, list[str]]:
+    if host["platform"] != "darwin" or host["machine"] != "arm64":
+        return "unsupported", ["apple/container requires a Mac with Apple silicon."]
+    version = host["macos_version"] or ""
+    major = int(version.split(".", 1)[0]) if version.split(".", 1)[0].isdigit() else 0
+    if major >= 26:
+        return "supported", []
+    if major == 15:
+        return "limited", [
+            "macOS 15 runs apple/container with limitations (isolated default network, no custom "
+            "networks); upstream supports macOS 26 and does not fix issues it cannot reproduce there.",
+        ]
+    return "unsupported", ["apple/container requires macOS 26 (macOS 15 with limitations)."]
+
+
+def container_resource_plan(host: ContainerHost, tier: str, image_estimate_gib: int) -> ResourcePlan:
+    """Suggest CPU, memory ceiling, and workspace-volume size for one workload tier."""
+    profile = TIER_PROFILES[tier]
+    total_cpus = max(1, host["cpus"])
+    usable_cpus = max(1, total_cpus - 2 if total_cpus > 4 else total_cpus - 1)
+    half_cpus = max(1, total_cpus // 2)
+    standard_cpus = clamp(min(host["performance_cores"] or half_cpus, half_cpus), 2, min(usable_cpus, 12))
+    if tier == "light":
+        cpus = clamp(2, 1, usable_cpus)
+        cpus_high = clamp(min(4, half_cpus), cpus, usable_cpus)
+    elif tier == "standard":
+        cpus = standard_cpus
+        cpus_high = clamp(cpus + 2, cpus, usable_cpus)
+    else:
+        cpus = clamp(total_cpus * 3 // 4, standard_cpus, usable_cpus)
+        cpus_high = max(cpus, usable_cpus)
+
+    warnings: list[str] = []
+    total_memory = host["memory_bytes"] // GIB
+    reserve = max(4, -(-total_memory // 4))
+    budget = max(1, total_memory - reserve)
+    memory = clamp(
+        round(total_memory * profile["memory_fraction"]),
+        min(profile["memory_min_gib"], budget),
+        min(profile["memory_max_gib"], budget),
+    )
+    if total_memory and budget < profile["memory_min_gib"]:
+        warnings.append(
+            f"{total_memory} GiB of host memory leaves little headroom for macOS; expect swapping under load."
+        )
+
+    free_disk = host["disk_free_bytes"] // GIB
+    capacity = max(0, (free_disk - image_estimate_gib) // 2)
+    disk = min(profile["disk_gib"], capacity)
+    disk_low = min(profile["disk_min_gib"], capacity)
+    disk_high = min(profile["disk_max_gib"], capacity)
+    if capacity < profile["disk_min_gib"]:
+        warnings.append(
+            f"Only {free_disk} GiB of host disk is free; the workspace volume is below the "
+            f"{profile['disk_min_gib']} GiB recommended for this workload."
+        )
+    if capacity < 5:
+        warnings.append("Free more host disk space before creating this container.")
+    return {
+        "tier": tier,
+        "cpus": cpus,
+        "cpus_range": [cpus, cpus_high],
+        "memory_gib": memory,
+        "disk_gib": disk,
+        "disk_range_gib": [disk_low, disk_high],
+        "image_estimate_gib": image_estimate_gib,
+        "warnings": warnings,
+    }
+
+
+def container_machine_type(config: str, cpus: int, memory_gib: int, disk_gib: int) -> str:
+    return f"{config}:{cpus}cpu-{memory_gib}gib-{disk_gib}gib"
+
+
+def container_cli_status() -> dict[str, object]:
+    executable = command_path("container")
+    result: dict[str, object] = {
+        "installed": bool(executable),
+        "path": executable,
+        "version": None,
+        "version_supported": None,
+        "service": None,
+    }
+    if not executable:
+        return result
+    version = run_text([executable, "--version"], timeout=10)
+    match = CONTAINER_VERSION_RE.search(version.stdout)
+    if match:
+        parsed = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+        result["version"] = ".".join(str(part) for part in parsed)
+        result["version_supported"] = parsed >= CONTAINER_MIN_VERSION
+    status = run_text([executable, "system", "status", "--format", "json"], timeout=30)
+    try:
+        payload: object = json.loads(status.stdout) if status.stdout.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    service = optional_string(cast(dict[str, object], payload).get("status")) if isinstance(payload, dict) else None
+    result["service"] = service or ("running" if status.returncode == 0 else "unknown")
+    return result
+
+
+def bundled_container_assets() -> Path:
+    return Path(__file__).resolve().parent.parent / "assets" / "containers"
+
+
+def ssh_layer_text() -> str:
+    path = bundled_container_assets() / "remote-computer-ssh-layer.dockerfile"
+    if not path.is_file():
+        raise FileNotFoundError(f"bundled SSH layer does not exist: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def ssh_layer_bounds(text: str) -> tuple[int, int] | None:
+    """Return the [start, end) character span of the managed SSH layer, validating placement."""
+    begin_count = text.count(SSH_LAYER_BEGIN)
+    end_count = text.count(SSH_LAYER_END)
+    if begin_count == 0 and end_count == 0:
+        return None
+    if begin_count != 1 or end_count != 1:
+        raise ValueError("the Dockerfile must contain exactly one remote-computer managed SSH layer")
+    start = text.index(SSH_LAYER_BEGIN)
+    end = text.index(SSH_LAYER_END) + len(SSH_LAYER_END)
+    if end < start:
+        raise ValueError("the remote-computer managed SSH layer markers are out of order")
+    if end < len(text) and text[end] == "\n":
+        end += 1
+    for line in text[end:].splitlines():
+        if line.strip() and not line.lstrip().startswith("#"):
+            raise ValueError("the remote-computer managed SSH layer must be the last block in the Dockerfile")
+    return start, end
+
+
+def ssh_layer_state(text: str) -> str:
+    try:
+        bounds = ssh_layer_bounds(text)
+    except ValueError:
+        return "invalid"
+    if bounds is None:
+        return "missing"
+    return "current" if text[bounds[0]:bounds[1]] == ssh_layer_text() else "outdated"
+
+
+def apply_ssh_layer(text: str) -> str:
+    layer = ssh_layer_text()
+    bounds = ssh_layer_bounds(text)
+    if bounds is None:
+        return f"{text.rstrip()}\n\n{layer}"
+    return f"{text[:bounds[0]]}{layer}{text[bounds[1]:]}"
+
+
+def dockerfile_instructions(text: str) -> list[tuple[str, str]]:
+    """Return (INSTRUCTION, arguments) pairs, folding continuations and heredoc bodies."""
+    instructions: list[tuple[str, str]] = []
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        index += 1
+        if not line or line.startswith("#"):
+            continue
+        logical = line
+        while logical.endswith("\\") and index < len(lines):
+            logical = f"{logical[:-1].rstrip()} {lines[index].strip()}"
+            index += 1
+        keyword, _, arguments = logical.partition(" ")
+        bodies: list[str] = []
+        for strip_tabs, delimiter in re.findall(r"<<(-?)\s*[\"']?([A-Za-z_][A-Za-z0-9_]*)[\"']?", arguments):
+            while index < len(lines):
+                body_line = lines[index]
+                index += 1
+                if (body_line.lstrip("\t") if strip_tabs else body_line) == delimiter:
+                    break
+                bodies.append(body_line)
+        instructions.append((keyword.upper(), " ".join([arguments, *bodies]).strip()))
+    return instructions
+
+
+def image_base_family(image: str | None, package_managers: set[str]) -> str:
+    if image is None:
+        return "unknown"
+    reference = image.lower()
+    name_and_tag = reference.rsplit("/", 1)[-1]
+    name, _, tag = name_and_tag.partition(":")
+    if "alpine" in reference:
+        return "alpine"
+    if name in NON_APT_BASE_NAMES or any(marker in tag for marker in NON_APT_TAG_MARKERS):
+        return "non-apt"
+    if name in APT_BASE_NAMES:
+        return "debian"
+    if "apt" in package_managers:
+        return "debian"
+    if "apk" in package_managers:
+        return "alpine"
+    if package_managers & {"dnf", "yum", "microdnf", "zypper", "pacman"}:
+        return "non-apt"
+    return "unknown"
+
+
+def analyze_dockerfile(text: str) -> DockerfileAnalysis:
+    """Heuristically size a Dockerfile; the agent reviews the result before proposing it."""
+    layer_state = ssh_layer_state(text)
+    user_text = text
+    bounds = ssh_layer_bounds(text) if layer_state != "invalid" else None
+    if bounds is not None:
+        user_text = text[:bounds[0]] + text[bounds[1]:]
+    instructions = dockerfile_instructions(user_text)
+    searchable = "\n".join(f"{keyword.lower()} {arguments.lower()}" for keyword, arguments in instructions)
+
+    stages: dict[str, str] = {}
+    final_base: str | None = None
+    for keyword, arguments in instructions:
+        if keyword != "FROM":
+            continue
+        words = [word for word in arguments.split() if not word.startswith("--")]
+        if not words:
+            continue
+        base = stages.get(words[0].lower(), words[0])
+        if len(words) >= 3 and words[1].lower() == "as":
+            stages[words[2].lower()] = base
+        final_base = base
+
+    package_managers = {
+        manager for manager, pattern in (
+            ("apt", r"\bapt(?:-get)?\s+install\b"),
+            ("apk", r"\bapk\s+add\b"),
+            ("dnf", r"\bdnf\s+install\b"),
+            ("yum", r"\byum\s+install\b"),
+            ("microdnf", r"\bmicrodnf\s+install\b"),
+            ("zypper", r"\bzypper\s+(?:install|in)\b"),
+            ("pacman", r"\bpacman\s+-S"),
+        ) if re.search(pattern, searchable)
+    }
+    family = image_base_family(final_base, package_managers)
+    languages = sorted(name for name, pattern in LANGUAGE_PATTERNS.items() if pattern.search(searchable))
+    services = sorted(name for name, pattern in SERVICE_PATTERNS.items() if pattern.search(searchable))
+    heavy = sorted(name for name, pattern in HEAVY_PATTERNS.items() if pattern.search(searchable))
+
+    reasons: list[str] = []
+    if languages:
+        reasons.append(f"languages/toolchains: {', '.join(languages)}")
+    if services:
+        reasons.append(f"local services: {', '.join(services)}")
+    if heavy:
+        reasons.append(f"heavy workloads: {', '.join(heavy)}")
+    if services or heavy or len(languages) >= 4:
+        tier = "heavy"
+    elif len(languages) >= 2 or COMPILED_LANGUAGES.intersection(languages):
+        tier = "standard"
+    else:
+        tier = "light"
+    reasons.append(f"inferred tier: {tier}")
+
+    warnings: list[str] = []
+    if family in {"alpine", "non-apt"}:
+        warnings.append(
+            "The final stage is not Debian/Ubuntu-based; the managed SSH layer and GPG porting require apt-get."
+        )
+    elif family == "unknown":
+        warnings.append("Could not identify the base distribution; the SSH layer build fails clearly without apt-get.")
+    replaced = sorted({keyword for keyword, _ in instructions if keyword in {"ENTRYPOINT", "CMD", "HEALTHCHECK"}})
+    if replaced:
+        warnings.append(
+            f"{'/'.join(replaced)} will be replaced by the SSH entrypoint; start long-running services "
+            "from an executable hook in /etc/remote-computer/boot.d/."
+        )
+    if any(keyword == "VOLUME" for keyword, _ in instructions):
+        warnings.append("Image VOLUME declarations are not used; persistent data belongs under /home.")
+    if "nested-containers" in heavy:
+        warnings.append(
+            "Docker/Podman inside the container needs --virtualization and a KVM-enabled kernel; "
+            "the default apple/container kernel does not support it."
+        )
+    uses_context = any(
+        keyword in {"COPY", "ADD"}
+        and "--from=" not in arguments
+        and "<<" not in arguments
+        and not re.match(r"^(?:--\S+\s+)*https?://", arguments)
+        for keyword, arguments in instructions
+    )
+    ports = sorted({
+        port for keyword, arguments in instructions if keyword == "EXPOSE" for port in arguments.split()
+    })
+    return {
+        "final_base_image": final_base,
+        "base_family": family,
+        "languages": languages,
+        "services": services,
+        "heavy_signals": heavy,
+        "tier": tier,
+        "reasons": reasons,
+        "warnings": warnings,
+        "uses_build_context": uses_context,
+        "exposed_ports": ports,
+        "ssh_layer": layer_state,
+    }
+
+
+def containers_dir(value: str | None) -> Path:
+    return Path(value).expanduser() if value else Path.home() / "Documents" / "Containers"
+
+
+def sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def load_container_manifest(directory: Path) -> ContainerManifest:
+    path = directory / CONTAINER_MANIFEST_NAME
+    if not path.exists():
+        return {"version": CONTAINER_MANIFEST_VERSION, "configs": {}}
+    try:
+        raw: object = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON in container manifest {path}: {exc}") from exc
+    if not isinstance(raw, dict) or cast(dict[str, object], raw).get("version") != CONTAINER_MANIFEST_VERSION:
+        raise ValueError(f"container manifest must be an object with version {CONTAINER_MANIFEST_VERSION}")
+    configs = cast(dict[str, object], raw).get("configs")
+    if not isinstance(configs, dict):
+        raise ValueError("container manifest field 'configs' must be an object")
+    fields = ("kind", "tier", "source", "context", "sha256", "updated_at")
+    for name, entry in cast(dict[str, object], configs).items():
+        if not NAME_RE.fullmatch(name) or not isinstance(entry, dict):
+            raise ValueError(f"invalid container manifest entry: {name}")
+        if not all(isinstance(cast(dict[str, object], entry).get(field), str) for field in fields):
+            raise ValueError(f"container manifest entry {name} is missing required string fields")
+    return cast(ContainerManifest, raw)
+
+
+def atomic_write_text(path: Path, text: str, mode: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def save_container_manifest(directory: Path, manifest: ContainerManifest) -> None:
+    atomic_write_text(
+        directory / CONTAINER_MANIFEST_NAME,
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        0o644,
+    )
+
+
+def sync_default_configs(directory: Path, manifest: ContainerManifest) -> list[dict[str, object]]:
+    """Install or refresh bundled defaults without overwriting a user's manual edits."""
+    results: list[dict[str, object]] = []
+    for name, metadata in DEFAULT_CONTAINER_CONFIGS.items():
+        source = bundled_container_assets() / name / "Dockerfile"
+        if not source.is_file():
+            raise FileNotFoundError(f"bundled container configuration does not exist: {source}")
+        bundled = source.read_text(encoding="utf-8")
+        bundled_sha = sha256_text(bundled)
+        target = directory / name / "Dockerfile"
+        previous = manifest["configs"].get(name)
+        if not target.exists():
+            action = "created"
+        else:
+            current_sha = sha256_text(target.read_text(encoding="utf-8"))
+            if current_sha == bundled_sha:
+                action = "unchanged"
+            elif previous is not None and previous["kind"] == "default" and previous["sha256"] == current_sha:
+                action = "updated"
+            else:
+                action = "modified-preserved"
+        if action in {"created", "updated"}:
+            atomic_write_text(target, bundled, 0o644)
+        if action != "modified-preserved":
+            manifest["configs"][name] = {
+                "kind": "default",
+                "tier": metadata["tier"],
+                "source": "bundled",
+                "context": str(target.parent),
+                "sha256": bundled_sha,
+                "updated_at": now() if action != "unchanged" or previous is None else previous["updated_at"],
+            }
+        results.append({"name": name, "action": action, "dockerfile": str(target)})
+    return results
+
+
+def prepare_containers_dir(value: str | None) -> tuple[Path, ContainerManifest, list[dict[str, object]]]:
+    directory = containers_dir(value)
+    directory.mkdir(parents=True, exist_ok=True)
+    manifest = load_container_manifest(directory)
+    defaults = sync_default_configs(directory, manifest)
+    save_container_manifest(directory, manifest)
+    return directory, manifest, defaults
+
+
+def container_image_tag(config: str) -> str:
+    return f"local/remote-computer-{config.lower()}:latest"
+
+
+def container_config_plan(
+    directory: Path,
+    manifest: ContainerManifest,
+    name: str,
+    host: ContainerHost,
+) -> dict[str, object]:
+    entry = manifest["configs"].get(name)
+    dockerfile = directory / name / "Dockerfile"
+    if entry is None or not dockerfile.is_file():
+        raise FileNotFoundError(f"container configuration is not registered: {dockerfile}")
+    text = dockerfile.read_text(encoding="utf-8")
+    analysis = analyze_dockerfile(text)
+    default = DEFAULT_CONTAINER_CONFIGS.get(name) if entry["kind"] == "default" else None
+    tier = default["tier"] if default else analysis["tier"]
+    estimate = default["image_estimate_gib"] if default else CUSTOM_IMAGE_ESTIMATES_GIB[tier]
+    resources = container_resource_plan(host, tier, estimate)
+    context = Path(entry["context"])
+    plan: dict[str, object] = {
+        "config": name,
+        "kind": entry["kind"],
+        "tier": tier,
+        "dockerfile": str(dockerfile),
+        "context": str(context),
+        "image": container_image_tag(name),
+        "ssh_layer": analysis["ssh_layer"],
+        "resources": resources,
+        "machine_type": container_machine_type(
+            name, resources["cpus"], resources["memory_gib"], resources["disk_gib"]
+        ),
+        "build_command": shlex.join([
+            "container", "build", "--tag", container_image_tag(name), "--file", str(dockerfile), str(context),
+        ]),
+        "action_required": [] if analysis["ssh_layer"] == "current" else [
+            f"The managed SSH layer is {analysis['ssh_layer']}; refresh it with container-config-import "
+            "before building (save edited defaults under a new name).",
+        ],
+    }
+    if default:
+        plan.update({
+            "title": default["title"],
+            "workload": default["workload"],
+            "toolchains": default["toolchains"],
+        })
+    else:
+        plan["analysis"] = analysis
+    return plan
+
+
 def cmd_doctor(args: argparse.Namespace) -> int:
     clip = clipboard_tool()
     result = {
         "platform": platform.system().lower(),
         "aws": {"installed": bool(command_path("aws")), "path": command_path("aws")},
         "gcp": {"installed": bool(command_path("gcloud")), "path": command_path("gcloud")},
+        "apple_container": {"installed": bool(command_path("container")), "path": command_path("container")},
         "git": {"installed": bool(command_path("git")), "path": command_path("git")},
         "gh": {"installed": bool(command_path("gh")), "path": command_path("gh")},
         "gpg": {"installed": bool(command_path("gpg")), "path": command_path("gpg")},
@@ -838,8 +1604,11 @@ def registered_vm_ssh(
         "-o", "BatchMode=yes",
         "-o", "ConnectTimeout=15",
         "-o", "StrictHostKeyChecking=accept-new",
-        "-i", str(access_path),
     ]
+    alias = host_key_alias(provider, vm_id)
+    if alias:
+        common.extend(["-o", f"HostKeyAlias={alias}"])
+    common.extend(["-i", str(access_path)])
     return vm, target, common
 
 
@@ -1014,33 +1783,15 @@ def cmd_github_install_key(args: argparse.Namespace) -> int:
     _, auth = found
     provider = str(args.provider)
     vm_id = str(args.id)
-    vm = next((record for record in data["vms"] if record["provider"] == provider and record["id"] == vm_id), None)
-    if vm is None:
-        raise ValueError(f"VM not found in registry: {provider}/{vm_id}")
     private = Path(auth["key_pair"]["private_path"]).expanduser()
     public = Path(auth["key_pair"]["public_path"]).expanduser()
     if not private.is_file() or not public.is_file():
         raise FileNotFoundError("registered GitHub key paths must both exist")
     if ssh_fingerprint(private) != auth["fingerprint"] or ssh_fingerprint(public) != auth["fingerprint"]:
         raise ValueError("registered GitHub key fingerprint no longer matches its files")
-    for executable in ("ssh", "scp"):
-        if not command_path(executable):
-            raise RuntimeError(f"{executable} is required")
-
-    access_path = Path(vm["key_pair"]["private_path"]).expanduser()
-    if not access_path.is_file():
-        raise FileNotFoundError(f"VM access key does not exist: {access_path}")
-    if not vm["public_ip"]:
-        raise ValueError(f"VM has no public IP: {provider}/{vm_id}")
-    access_key = str(access_path)
-    target = f"{vm['ssh_user']}@{vm['public_ip']}"
-    common = [
-        "-o", "IdentitiesOnly=yes",
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=15",
-        "-o", "StrictHostKeyChecking=accept-new",
-        "-i", access_key,
-    ]
+    _, target, common = registered_vm_ssh(data, provider, vm_id)
+    if not command_path("scp"):
+        raise RuntimeError("scp is required")
     fingerprint_slug = re.sub(r"[^A-Za-z0-9]", "", auth["fingerprint"].removeprefix("SHA256:"))[:16]
     remote_name = f"{host}-{account}-{fingerprint_slug}"
     remote_private = f".ssh/remote-computer/github/{remote_name}"
@@ -1148,14 +1899,22 @@ def cmd_sync(args: argparse.Namespace) -> int:
     data = load_registry(path, create=False)
     results: list[dict[str, object]] = []
     changed = False
+    containers: dict[str, ContainerState] | None = None
     for record in data["vms"]:
         provider = record["provider"]
-        executable = "aws" if provider == "aws" else "gcloud"
+        executable = PROVIDER_CLIS[provider]
         if not command_path(executable):
             results.append({"provider": provider, "id": record["id"], "result": "skipped", "reason": f"{executable} not installed"})
             continue
         try:
-            status, public_ip = aws_state(record) if provider == "aws" else gcp_state(record)
+            if provider == CONTAINER_PROVIDER:
+                if containers is None:
+                    containers = container_states()
+                status, public_ip = container_state(record, containers)
+            elif provider == "aws":
+                status, public_ip = aws_state(record)
+            else:
+                status, public_ip = gcp_state(record)
             record["status"] = status
             if public_ip:
                 record["public_ip"] = public_ip
@@ -1168,6 +1927,206 @@ def cmd_sync(args: argparse.Namespace) -> int:
         save_registry(path, data)
     print(json.dumps({"changed": changed, "path": str(path), "results": results}, indent=2, sort_keys=True))
     return 1 if any(item["result"] == "error" for item in results) else 0
+
+
+def cmd_ssh_command(args: argparse.Namespace) -> int:
+    data = load_registry(registry_path(args.registry), create=False)
+    provider = str(args.provider)
+    vm_id = str(args.id)
+    vm = next((
+        record for record in data["vms"]
+        if record["provider"] == provider and record["id"] == vm_id
+    ), None)
+    if vm is None:
+        raise ValueError(f"VM not found in registry: {provider}/{vm_id}")
+    if not vm["public_ip"]:
+        raise ValueError(f"VM has no reachable IP: {provider}/{vm_id}")
+    print(json.dumps({
+        "command": shlex.join(ssh_login_command(vm)),
+        "host_key_alias": host_key_alias(provider, vm_id),
+        "id": vm_id,
+        "provider": provider,
+    }, sort_keys=True))
+    return 0
+
+
+def cmd_container_plan(args: argparse.Namespace) -> int:
+    directory, manifest, defaults = prepare_containers_dir(args.dir)
+    host = detect_container_host()
+    support, notes = container_host_support(host)
+    names = [str(args.config)] if args.config else list(DEFAULT_CONTAINER_CONFIGS)
+    print(json.dumps({
+        "configs_dir": str(directory),
+        "container_cli": container_cli_status(),
+        "default_configs": defaults,
+        "disk_note": DISK_CEILING_NOTE,
+        "host": {
+            **host,
+            "memory_gib": host["memory_bytes"] // GIB,
+            "disk_free_gib": host["disk_free_bytes"] // GIB,
+        },
+        "memory_note": MEMORY_CEILING_NOTE,
+        "plans": [container_config_plan(directory, manifest, name, host) for name in names],
+        "support": {"status": support, "notes": notes},
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_container_configs(args: argparse.Namespace) -> int:
+    directory, manifest, defaults = prepare_containers_dir(args.dir)
+    configs: list[dict[str, object]] = []
+    for dockerfile in sorted(directory.glob("*/Dockerfile")):
+        name = dockerfile.parent.name
+        text = dockerfile.read_text(encoding="utf-8")
+        entry = manifest["configs"].get(name)
+        configs.append({
+            "name": name,
+            "kind": entry["kind"] if entry else "untracked",
+            "tier": entry["tier"] if entry else None,
+            "dockerfile": str(dockerfile),
+            "context": entry["context"] if entry else None,
+            "modified": entry["sha256"] != sha256_text(text) if entry else None,
+            "ssh_layer": ssh_layer_state(text),
+        })
+    print(json.dumps({
+        "configs": configs,
+        "configs_dir": str(directory),
+        "default_configs": defaults,
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_container_config_import(args: argparse.Namespace) -> int:
+    name = str(args.name)
+    if not NAME_RE.fullmatch(name) or name.startswith("."):
+        raise ValueError("configuration names must use 1-63 letters, digits, dots, underscores, or hyphens")
+    if name in DEFAULT_CONTAINER_CONFIGS:
+        raise ValueError(f"{name} is a maintained default; save customizations under a new name")
+    directory, manifest, _ = prepare_containers_dir(args.dir)
+    source = Path(args.dockerfile).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Dockerfile does not exist: {source}")
+    target = directory / name / "Dockerfile"
+    original = source.read_text(encoding="utf-8")
+    text = apply_ssh_layer(original)
+    in_place = target.exists() and target.resolve() == source
+    if in_place:
+        action = "refreshed" if text != original else "unchanged"
+    elif not target.exists():
+        action = "created"
+    elif target.read_text(encoding="utf-8") == text:
+        action = "unchanged"
+    elif args.replace:
+        action = "replaced"
+    else:
+        raise FileExistsError(
+            f"refusing to overwrite custom configuration {target}; confirm with the user and pass --replace"
+        )
+    analysis = analyze_dockerfile(text)
+    previous = manifest["configs"].get(name)
+    if args.context:
+        context = Path(args.context).expanduser().resolve()
+    elif previous is not None:
+        context = Path(previous["context"])
+    elif analysis["uses_build_context"] and not in_place:
+        context = source.parent
+    else:
+        context = target.parent
+    if context != target.parent and not context.is_dir():
+        raise FileNotFoundError(f"build context directory does not exist: {context}")
+    if action != "unchanged":
+        atomic_write_text(target, text, 0o644)
+    manifest["configs"][name] = {
+        "kind": "custom",
+        "tier": analysis["tier"],
+        "source": str(previous["source"] if in_place and previous else source),
+        "context": str(context),
+        "sha256": sha256_text(text),
+        "updated_at": now(),
+    }
+    save_container_manifest(directory, manifest)
+    print(json.dumps({
+        "action": action,
+        "analysis": analysis,
+        "context": str(context),
+        "dockerfile": str(target),
+        "name": name,
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_container_status(args: argparse.Namespace) -> int:
+    name = str(args.id)
+    validate_container_name(name)
+    if not command_path("container"):
+        raise RuntimeError("the apple/container CLI is not installed")
+    deadline = time.monotonic() + max(0, int(args.wait))
+    while True:
+        found = container_states().get(name)
+        ready = found is not None and found["state"] == "running" and bool(found["ip"])
+        if ready or time.monotonic() >= deadline:
+            break
+        time.sleep(2)
+    if found is None:
+        raise ValueError(f"container not found: {name}")
+    address = ipaddress.ip_address(found["ip"]) if found["ip"] else None
+    print(json.dumps({
+        **found,
+        "private_address": address.is_private if address else None,
+        "ready": ready,
+    }, indent=2, sort_keys=True))
+    return 0 if ready else 1
+
+
+def known_host_entries(known_hosts: Path, alias: str) -> list[tuple[str, str]]:
+    if not known_hosts.exists():
+        return []
+    result = run_text(["ssh-keygen", "-F", alias, "-f", str(known_hosts)], timeout=10)
+    entries: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 3 and not line.startswith("#"):
+            entries.append((fields[1], fields[2]))
+    return entries
+
+
+def cmd_container_trust_host_key(args: argparse.Namespace) -> int:
+    name = str(args.id)
+    validate_container_name(name)
+    for executable in ("container", "ssh-keygen"):
+        if not command_path(executable):
+            raise RuntimeError(f"{executable} is required")
+    public_key = checked_text(["container", "exec", name, "cat", CONTAINER_HOST_KEY], timeout=30)
+    fields = public_key.split()
+    if len(fields) < 2 or fields[0] != "ssh-ed25519":
+        raise RuntimeError("the container did not return an Ed25519 SSH host key")
+    alias = host_key_alias(CONTAINER_PROVIDER, name)
+    if alias is None:
+        raise RuntimeError("could not derive the container host-key alias")
+    known_hosts = Path(args.known_hosts).expanduser() if args.known_hosts else Path.home() / ".ssh" / "known_hosts"
+    entries = known_host_entries(known_hosts, alias)
+    if (fields[0], fields[1]) in entries:
+        action = "already-trusted"
+    elif any(key_type == fields[0] for key_type, _ in entries):
+        raise ValueError(
+            f"{known_hosts} already trusts a different {fields[0]} key for {alias}; confirm the container "
+            f"was recreated without its home volume, then remove it with: ssh-keygen -R {alias}"
+        )
+    else:
+        known_hosts.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        created = not known_hosts.exists()
+        with known_hosts.open("a", encoding="utf-8") as handle:
+            handle.write(f"{alias} {fields[0]} {fields[1]}\n")
+        if created:
+            os.chmod(known_hosts, 0o600)
+        action = "trusted"
+    print(json.dumps({
+        "action": action,
+        "alias": alias,
+        "fingerprint": ssh_text_fingerprint(f"{fields[0]} {fields[1]}"),
+        "known_hosts": str(known_hosts),
+    }, sort_keys=True))
+    return 0
 
 
 def cmd_copy_ssh(args: argparse.Namespace) -> int:
@@ -1188,7 +2147,7 @@ def cmd_copy_ssh(args: argparse.Namespace) -> int:
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description=__doc__)
     sub = root.add_subparsers(dest="subcommand", required=True)
-    doctor = sub.add_parser("doctor", help="detect cloud, GitHub, SSH, GPG, and clipboard tooling")
+    doctor = sub.add_parser("doctor", help="detect cloud, container, GitHub, SSH, GPG, and clipboard tooling")
     doctor.set_defaults(func=cmd_doctor)
 
     init = sub.add_parser("init", help="create or validate the VM registry")
@@ -1297,6 +2256,63 @@ def parser() -> argparse.ArgumentParser:
     sync = sub.add_parser("sync", help="query providers and update all registered VM states")
     sync.add_argument("--registry")
     sync.set_defaults(func=cmd_sync)
+
+    ssh_command = sub.add_parser("ssh-command", help="print the direct SSH command for one registered VM")
+    ssh_command.add_argument("--registry")
+    ssh_command.add_argument("--provider", choices=sorted(VALID_PROVIDERS), required=True)
+    ssh_command.add_argument("--id", required=True)
+    ssh_command.set_defaults(func=cmd_ssh_command)
+
+    container_plan = sub.add_parser(
+        "container-plan",
+        help="detect Mac resources and suggest apple/container sizes for default or saved configurations",
+    )
+    container_plan.add_argument("--dir", help="configuration directory; defaults to ~/Documents/Containers")
+    container_plan.add_argument("--config", help="plan one saved configuration instead of every default")
+    container_plan.set_defaults(func=cmd_container_plan)
+
+    container_configs = sub.add_parser(
+        "container-configs",
+        help="install or refresh default Dockerfiles and list saved container configurations",
+    )
+    container_configs.add_argument("--dir", help="configuration directory; defaults to ~/Documents/Containers")
+    container_configs.set_defaults(func=cmd_container_configs)
+
+    container_import = sub.add_parser(
+        "container-config-import",
+        help="save a custom Dockerfile as a configuration and add or refresh the managed SSH layer",
+    )
+    container_import.add_argument("--dir", help="configuration directory; defaults to ~/Documents/Containers")
+    container_import.add_argument("--name", required=True)
+    container_import.add_argument("--dockerfile", required=True)
+    container_import.add_argument("--context", help="build context directory for COPY/ADD instructions")
+    container_import.add_argument(
+        "--replace",
+        action="store_true",
+        help="overwrite a different saved custom configuration after user confirmation",
+    )
+    container_import.set_defaults(func=cmd_container_config_import)
+
+    container_status = sub.add_parser(
+        "container-status",
+        help="report one apple/container container's state, IP, image, and resources",
+    )
+    container_status.add_argument("--id", required=True)
+    container_status.add_argument(
+        "--wait",
+        type=int,
+        default=0,
+        help="seconds to wait for the running state and an IP address",
+    )
+    container_status.set_defaults(func=cmd_container_status)
+
+    container_trust = sub.add_parser(
+        "container-trust-host-key",
+        help="read a container's SSH host key through container exec and trust it under its alias",
+    )
+    container_trust.add_argument("--id", required=True)
+    container_trust.add_argument("--known-hosts", help="known_hosts file; defaults to ~/.ssh/known_hosts")
+    container_trust.set_defaults(func=cmd_container_trust_host_key)
 
     copy_ssh = sub.add_parser("copy-ssh", help="copy a direct SSH command or print it as fallback")
     copy_ssh.add_argument("--command", required=True)
