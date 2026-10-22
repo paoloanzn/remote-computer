@@ -1,4 +1,4 @@
 interface:
   display_name: "Remote Computer"
-  short_description: "Provision cloud VMs with GitHub-ready access"
-  default_prompt: "Use $remote-computer to provision a tracked cloud development VM and optionally port GitHub authentication and commit signing."
+  short_description: "Provision cloud VMs or Mac containers with GitHub access"
+  default_prompt: "Use $remote-computer to provision a tracked cloud development VM or local Apple container and optionally port GitHub authentication and commit signing."

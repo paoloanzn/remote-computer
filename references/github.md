@@ -89,7 +89,7 @@ After user confirmation:
 ```bash
 python3 scripts/vm_bookkeeper.py github-install-key \
   --host github.com --account <login> \
-  --provider <aws|gcp> --id <provider-native-vm-id>
+  --provider <aws|gcp|apple-container> --id <provider-native-vm-id>
 ```
 
 The helper:
@@ -123,11 +123,11 @@ For OpenPGP signing, first show the resolved full fingerprint and obtain explici
 
 ```bash
 python3 scripts/vm_bookkeeper.py github-install-gpg \
-  --provider <aws|gcp> --id <provider-native-vm-id> \
+  --provider <aws|gcp|apple-container> --id <provider-native-vm-id> \
   --fingerprint <full-openpgp-fingerprint>
 ```
 
-The command is intentionally limited to apt-based Ubuntu/Debian VMs, including the default Ubuntu 24.04 image. It:
+The command is intentionally limited to apt-based Ubuntu/Debian VMs, including the default Ubuntu 24.04 image and every Apple container configuration, whose managed SSH layer requires an apt-based image and grants `ubuntu` passwordless sudo. It:
 
 1. Verifies that the selector resolves to exactly one local OpenPGP secret-key fingerprint.
 2. Installs `python3`, `git`, `gnupg`, `gpg-agent`, and `pinentry-curses` remotely as root or with non-interactive, passwordless `sudo`; it stops if the VM is not apt-based or requires an interactive sudo password.
@@ -143,7 +143,7 @@ Run the printed command in a real local terminal:
 
 ```bash
 python3 scripts/vm_bookkeeper.py github-verify-gpg \
-  --provider <aws|gcp> --id <provider-native-vm-id> \
+  --provider <aws|gcp|apple-container> --id <provider-native-vm-id> \
   --fingerprint <full-openpgp-fingerprint>
 ```
 

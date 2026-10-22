@@ -46,5 +46,6 @@ jobs:
           diff -ru agents "$installed/agents"
           diff -ru scripts "$installed/scripts"
           diff -ru references "$installed/references"
+          diff -ru assets "$installed/assets"
           test ! -e "$installed/tests"
           test ! -e "$installed/.git"

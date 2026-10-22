@@ -25,6 +25,17 @@ class SkillContentTests(unittest.TestCase):
             "pbcopy",
             "wl-copy",
             "Create these cloud resources now?",
+            "Create this local container now?",
+            "references/apple-container.md",
+            "container-plan",
+            "container-config-import",
+            "container-trust-host-key",
+            "ssh-command",
+            "~/Documents/Containers",
+            "apple-container",
+            "essentials",
+            "polyglot",
+            "fullstack",
         )
         for text in required:
             with self.subTest(text=text):
@@ -51,6 +62,27 @@ class SkillContentTests(unittest.TestCase):
         self.assertIn("pinentry-curses", github)
         self.assertIn("gpg-agent", github)
         self.assertIn("Never replace or remove signing configuration", github)
+
+    def test_apple_container_reference_is_grounded_and_safe(self):
+        reference = (ROOT / "references" / "apple-container.md").read_text()
+        for text in (
+            "https://github.com/apple/container",
+            "container-builder-shim",
+            "container run --detach",
+            "--volume remote-computer-<name>-home:/home",
+            "container volume create -s",
+            "REMOTE_COMPUTER_AUTHORIZED_KEY",
+            "ceiling",
+            "container-config-import",
+            "--provider apple-container",
+            "Do you have a Dockerfile",
+            "container machine",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(text, reference)
+        self.assertNotIn("--publish 22", reference)
+        self.assertNotIn("-p 22", reference)
+        self.assertNotIn("0.0.0.0/0", reference)
 
     def test_default_prompt_names_skill(self):
         metadata = (ROOT / "agents" / "openai.yaml").read_text()
